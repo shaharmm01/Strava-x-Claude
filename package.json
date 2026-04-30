@@ -1,0 +1,19 @@
+{
+  "name": "strava-coach",
+  "version": "1.0.0",
+  "description": "Personal AI coaching agent powered by Strava + Claude",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.52.0",
+    "@composio/core": "^0.1.0",
+    "@supabase/supabase-js": "^2.49.0",
+    "dotenv": "^16.5.0",
+    "express": "^4.21.0"
+  }
+}
