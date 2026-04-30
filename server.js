@@ -251,6 +251,31 @@ function isWeatherQuestion(text) {
   return /\b(when|best time|what time|weather|forecast|today|tomorrow|run today|run tomorrow|should i run)\b/i.test(text);
 }
 
+function calculateSunriseSunset() {
+  const LAT = parseFloat(process.env.RUNNER_LAT);
+  const LON = parseFloat(process.env.RUNNER_LON);
+
+  const n = (Date.now() / 86400000) + 0.0008 + 2440587.5 - 2451545;
+  const J = Math.floor(n) - LON / 360;
+  const M = (357.5291 + 0.98560028 * J) % 360.0;
+  const M_rad = M * Math.PI / 180;
+  const C = 1.9148 * Math.sin(M_rad) + 0.02 * Math.sin(2 * M_rad) + 0.0003 * Math.sin(3 * M_rad);
+  const gamma = (M + C + 180 + 102.9372) % 360.0;
+  const gamma_rad = gamma * Math.PI / 180;
+  const J_transit = 2451545 + J + 0.0053 * Math.sin(M_rad) - 0.0069 * Math.sin(2 * gamma_rad);
+  const sin_delta = Math.sin(gamma_rad) * Math.sin(23.4397 * Math.PI / 180);
+  const cos_delta = Math.cos(Math.asin(sin_delta));
+  const cos_omega_0 = (Math.sin(-0.833 * Math.PI / 180) - Math.sin(LAT * Math.PI / 180) * sin_delta) / (Math.cos(LAT * Math.PI / 180) * cos_delta);
+  const hi = Math.acos(cos_omega_0);
+  const JRise = J_transit - hi / (2 * Math.PI);
+  const JSet  = J_transit + hi / (2 * Math.PI);
+
+  return {
+    sunrise: new Date((JRise - 0.0008 - 2440587.5) * 86400000),
+    sunset:  new Date((JSet  - 0.0008 - 2440587.5) * 86400000),
+  };
+}
+
 async function getWeatherForecast() {
   const lat = process.env.RUNNER_LAT;
   const lon = process.env.RUNNER_LON;
@@ -281,27 +306,49 @@ async function getWeatherForecast() {
   return slots || 'No forecast data available';
 }
 
-function parseWindowDays(text) {
+const MONTHS = { january:0, february:1, march:2, april:3, may:4, june:5, july:6, august:7, september:8, october:9, november:10, december:11, jan:0, feb:1, mar:2, apr:3, jun:5, jul:6, aug:7, sep:8, oct:9, nov:10, dec:11 };
+
+function parseTimeWindow(text) {
   const t = text.toLowerCase();
-  if (/last\s+week/.test(t)) return 7;
-  if (/last\s+month/.test(t)) return 30;
-  const match = t.match(/last\s+(\d+)\s+(day|week|month)s?/);
-  if (match) {
-    const n = parseInt(match[1]);
-    if (match[2] === 'week') return n * 7;
-    if (match[2] === 'month') return n * 30;
-    return n;
+
+  // "last week" / "last month"
+  if (/last\s+week/.test(t)) return { cutoff: daysAgo(7), label: 'last 7 days' };
+  if (/last\s+month/.test(t)) return { cutoff: daysAgo(30), label: 'last 30 days' };
+
+  // "last N days/weeks/months" or "N days/weeks/months ago"
+  const rel = t.match(/(\d+)\s+(day|week|month)s?\s+ago/) || t.match(/last\s+(\d+)\s+(day|week|month)s?/);
+  if (rel) {
+    const n = parseInt(rel[1]);
+    const unit = rel[2];
+    const days = unit === 'week' ? n * 7 : unit === 'month' ? n * 30 : n;
+    return { cutoff: daysAgo(days), label: `last ${days} days` };
   }
-  return 14;
+
+  // "since/from/at/on February 3" or "February 3" or "Feb 3"
+  const abs = t.match(/(?:since|from|at|on)?\s*([a-z]+)\s+(\d{1,2})/);
+  if (abs && MONTHS[abs[1]] !== undefined) {
+    const month = MONTHS[abs[1]];
+    const day = parseInt(abs[2]);
+    const now = new Date();
+    let year = now.getFullYear();
+    const d = new Date(year, month, day);
+    if (d > now) d.setFullYear(year - 1); // if date is in the future, use last year
+    return { cutoff: d.toISOString(), label: `since ${abs[1]} ${day}` };
+  }
+
+  return { cutoff: daysAgo(14), label: 'last 14 days' };
+}
+
+function daysAgo(n) {
+  return new Date(Date.now() - n * 24 * 60 * 60 * 1000).toISOString();
 }
 
 async function getCoachingResponse(userText) {
-  const days = parseWindowDays(userText);
-  const cutoff = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
+  const { cutoff, label } = parseTimeWindow(userText);
 
   const { data: activities, error } = await supabase
     .from('activities')
-    .select('type, distance_m, moving_time_s, started_at')
+    .select('type, distance_m, moving_time_s, started_at, raw')
     .gte('started_at', cutoff)
     .order('started_at', { ascending: false });
 
@@ -330,7 +377,9 @@ async function getCoachingResponse(userText) {
           pace = ` @ ${pm}:${String(ps).padStart(2, '0')}/km`;
         }
 
-        return `${date}: ${a.type ?? 'Unknown'}, ${km} km, ${duration}${pace}`;
+        const avgHR = a.raw?.average_heartrate ? `avg HR ${Math.round(a.raw.average_heartrate)}/${a.raw.max_heartrate} bpm` : '';
+
+        return `${date}: ${a.type ?? 'Unknown'}, ${km} km, ${duration}${pace}${avgHR ? ', ' + avgHR : ''}`;
       })
       .join('\n');
   }
@@ -338,7 +387,9 @@ async function getCoachingResponse(userText) {
   let weatherSection = '';
   try {
     const forecast = await getWeatherForecast();
-    weatherSection = `\nWeather forecast for ${process.env.RUNNER_LOCATION} (next 48h):\n${forecast}\n`;
+    const { sunrise, sunset } = calculateSunriseSunset();
+    const fmt = (d) => d.toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit', timeZone: 'Asia/Jerusalem' });
+    weatherSection = `\nWeather forecast for ${process.env.RUNNER_LOCATION} (next 48h):\n${forecast}\nSunrise: ${fmt(sunrise)}, Sunset: ${fmt(sunset)}\n`;
     console.log('[weather] Included in prompt');
   } catch (err) {
     console.error('[weather] Forecast error:', err.message);
@@ -352,7 +403,7 @@ async function getCoachingResponse(userText) {
     messages: [
       {
         role: 'user',
-        content: `Recent training (last ${days} days):\n${summary}\n${weatherSection}\nAthlete: ${userText}`,
+        content: `Recent training (${label}):\n${summary}\n${weatherSection}\nAthlete: ${userText}`,
       },
     ],
   });
