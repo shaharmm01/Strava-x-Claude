@@ -4,6 +4,9 @@ require('dotenv').config();
 const express = require('express');
 const { createClient } = require('@supabase/supabase-js');
 const Anthropic = require('@anthropic-ai/sdk');
+const cron = require('node-cron');
+const axios = require('axios');
+const cheerio = require('cheerio');
 
 const app = express();
 app.use(express.json());
@@ -16,6 +19,32 @@ const supabase = createClient(
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
 app.get('/health', (_req, res) => res.status(200).send('OK'));
+
+// Manual briefing trigger: GET /briefing/:secret
+app.get('/briefing/:secret', async (req, res) => {
+  if (req.params.secret !== process.env.COMPOSIO_WEBHOOK_SECRET) return res.status(401).send('Unauthorized');
+  res.status(200).send('Briefing triggered');
+  try {
+    const message = await generateMorningBriefing();
+    await sendTelegram(process.env.TELEGRAM_OWNER_CHAT_ID, message);
+    console.log('[briefing] Manual trigger sent');
+  } catch (err) {
+    console.error('[briefing] Manual trigger error:', err.message);
+  }
+});
+
+// Manual weekly report trigger: GET /weekly/:secret
+app.get('/weekly/:secret', async (req, res) => {
+  if (req.params.secret !== process.env.COMPOSIO_WEBHOOK_SECRET) return res.status(401).send('Unauthorized');
+  res.status(200).send('Weekly report triggered');
+  try {
+    const message = await generateWeeklyReport();
+    await sendTelegram(process.env.TELEGRAM_OWNER_CHAT_ID, message);
+    console.log('[weekly] Manual trigger sent');
+  } catch (err) {
+    console.error('[weekly] Manual trigger error:', err.message);
+  }
+});
 
 // Strava OAuth — start the auth flow
 app.get('/auth/strava', (_req, res) => {
@@ -291,13 +320,10 @@ async function getWeatherForecast() {
   const slots = data.list
     .filter((s) => s.dt > now && s.dt < now + 172800)
     .map((s) => {
-      const d = new Date(s.dt * 1000);
-      const label = d.toLocaleString('en-GB', {
-        weekday: 'short',
-        hour: '2-digit',
-        minute: '2-digit',
-        timeZone: 'Asia/Jerusalem',
-      });
+      const DAYS = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
+      const localSec = s.dt + 3 * 3600; // Israel = UTC+3 (summer)
+      const ld = new Date(localSec * 1000);
+      const label = `${DAYS[ld.getUTCDay()]} ${String(ld.getUTCHours()).padStart(2,'0')}:${String(ld.getUTCMinutes()).padStart(2,'0')}`;
       return `${label}: ${Math.round(s.main.temp)}°C, ${s.weather[0].description}, wind ${Math.round(s.wind.speed)} m/s, humidity ${s.main.humidity}%`;
     })
     .join('\n');
@@ -410,6 +436,318 @@ async function getCoachingResponse(userText) {
 
   return response.content[0].text;
 }
+
+async function fetchMFPDiary(dateStr) {
+  const url = `https://www.myfitnesspal.com/food/diary/zivshahar01?date=${dateStr}`;
+  const { data: html } = await axios.get(url, {
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+      'Accept-Language': 'en-US,en;q=0.9',
+    },
+    timeout: 10000,
+  });
+
+  const $ = cheerio.load(html);
+
+  // MFP totals row is in the bottom of the diary table
+  const totalsRow = $('tr.total').last();
+  const cols = totalsRow.find('td').map((_, el) => $(el).text().trim().replace(/,/g, '')).get();
+
+  // Column order: Calories, Carbs, Fat, Protein, Sodium, Sugar (may vary)
+  // Find the header row to map columns correctly
+  const headers = $('thead tr th').map((_, el) => $(el).text().trim().toLowerCase()).get();
+
+  const getValue = (name) => {
+    const idx = headers.findIndex(h => h.includes(name));
+    return idx >= 0 && cols[idx] ? parseInt(cols[idx]) || null : null;
+  };
+
+  const calories = getValue('calories') ?? (cols[1] ? parseInt(cols[1]) : null);
+  const carbs    = getValue('carb');
+  const fat      = getValue('fat');
+  const protein  = getValue('protein');
+  const fiber    = getValue('fiber');
+  const sugar    = getValue('sugar');
+
+  return { calories, protein_g: protein, carbs_g: carbs, fat_g: fat, fiber_g: fiber, sugar_g: sugar, raw: { url, date: dateStr } };
+}
+
+async function storeDailyNutrition(dateStr) {
+  try {
+    const nutrition = await fetchMFPDiary(dateStr);
+    if (!nutrition.calories) { console.log(`[mfp] No data for ${dateStr}`); return null; }
+    await supabase.from('nutrition_log').upsert({ date: dateStr, ...nutrition });
+    console.log(`[mfp] Stored nutrition for ${dateStr}: ${nutrition.calories} kcal`);
+    return nutrition;
+  } catch (err) {
+    console.error('[mfp] Fetch error:', err.message);
+    return null;
+  }
+}
+
+async function getStoredNutrition(dateStr) {
+  const { data } = await supabase.from('nutrition_log').select('*').eq('date', dateStr).single();
+  return data ?? null;
+}
+
+async function generateMorningBriefing() {
+  const forecast = await getWeatherForecast();
+  const { sunrise, sunset } = calculateSunriseSunset();
+  const fmt = (d) => d.toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit', timeZone: 'Asia/Jerusalem' });
+
+  const response = await anthropic.messages.create({
+    model: 'claude-sonnet-4-6',
+    max_tokens: 600,
+    system: 'You are an expert endurance coach sending a concise daily morning briefing. Use metric units. No markdown, just clean text with line breaks.',
+    messages: [{
+      role: 'user',
+      content: `Generate a morning briefing for an athlete in ${process.env.RUNNER_LOCATION}.
+
+Weather forecast (next 48h):
+${forecast}
+
+Sunrise: ${fmt(sunrise)}, Sunset: ${fmt(sunset)}
+
+Include:
+1. One-line weather summary for today
+2. Best 1-2 hour window to run today (based on temperature, wind, rain, and daylight)
+3. Any heat/rain/wind warnings if relevant
+
+Keep it under 150 words. Start with the date.`,
+    }],
+  });
+
+  const yesterday = new Date(Date.now() - 86400000).toISOString().slice(0, 10);
+  const nutrition = await storeDailyNutrition(yesterday);
+  let nutritionLine = '';
+  if (nutrition?.calories) {
+    nutritionLine = `\n\n🍽 Yesterday's nutrition: ${nutrition.calories} kcal · P ${nutrition.protein_g}g · C ${nutrition.carbs_g}g · F ${nutrition.fat_g}g`;
+  }
+
+  return `🌅 Morning Briefing\n\n${response.content[0].text}${nutritionLine}\n\n— Garmin recovery & TrainingPeaks coming soon`;
+}
+
+function getEffortMultiplier(paceSecPerKm) {
+  const m = paceSecPerKm / 60;
+  if (m < 4.5) return 2.0;
+  if (m < 5.0) return 1.7;
+  if (m < 5.5) return 1.4;
+  if (m < 6.0) return 1.1;
+  return 0.7;
+}
+
+function scoreRun(a) {
+  const raw = a.raw ?? {};
+  const distKm   = (a.distance_m ?? 0) / 1000;
+  const avgSpeed = raw.average_speed ?? 0;   // m/s
+  const avgHR    = raw.average_heartrate;
+  const avgWatts = raw.device_watts ? raw.average_watts : null;
+
+  if (distKm === 0 || avgSpeed === 0) return null;
+
+  const paceSecPerKm = 1000 / avgSpeed;
+  const mult = getEffortMultiplier(paceSecPerKm);
+
+  const effortIntensity = avgSpeed * avgSpeed * mult;
+  const hrEfficiency    = avgHR ? (avgSpeed / avgHR) * distKm : 0;
+  const powerOutput     = avgWatts && avgHR ? (avgWatts / avgHR) * distKm : null;
+  const distBonus       = Math.log(Math.max(distKm, 1)) * mult;
+
+  const score = powerOutput !== null
+    ? effortIntensity * 0.35 + (hrEfficiency * 15) * 0.35 + powerOutput * 0.20 + distBonus * 0.10
+    : effortIntensity * 0.45 + (hrEfficiency * 15) * 0.45 + distBonus * 0.10;
+
+  return { score, distKm, paceSecPerKm, effortIntensity, hrEfficiency, powerOutput, distBonus, hasPower: powerOutput !== null, avgHR, avgSpeed };
+}
+
+function bestRunOfWeek(activities) {
+  const runs = activities.filter(a => (a.raw?.sport_type ?? a.type) === 'Run');
+  if (!runs.length) return null;
+
+  const scored = runs.map(a => ({ a, s: scoreRun(a) })).filter(x => x.s !== null);
+  if (!scored.length) return { a: runs[0], s: null };
+
+  scored.sort((x, y) => y.s.score - x.s.score);
+  // If top two within 2%, pick the longer one
+  if (scored.length > 1 && Math.abs(scored[0].s.score - scored[1].s.score) / scored[0].s.score < 0.02) {
+    return scored[0].s.distKm >= scored[1].s.distKm ? scored[0] : scored[1];
+  }
+  return scored[0];
+}
+
+async function generateWeeklyReport() {
+  const now = new Date();
+  const weekStart   = new Date(now - 7  * 86400000);
+  const w1Start     = new Date(now - 14 * 86400000);
+  const w2Start     = new Date(now - 21 * 86400000);
+  const w3Start     = new Date(now - 28 * 86400000);
+  const w4Start     = new Date(now - 35 * 86400000);
+
+  const fetchActs = async (from, to) => {
+    let q = supabase.from('activities').select('type, distance_m, moving_time_s, started_at, raw').gte('started_at', from.toISOString());
+    if (to) q = q.lt('started_at', to.toISOString());
+    const { data } = await q;
+    return data ?? [];
+  };
+
+  const [thisWeek, week1, week2, week3, week4] = await Promise.all([
+    fetchActs(weekStart),
+    fetchActs(w1Start, weekStart),
+    fetchActs(w2Start, w1Start),
+    fetchActs(w3Start, w2Start),
+    fetchActs(w4Start, w3Start),
+  ]);
+
+  const fmtTime = (s) => { const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60); return h > 0 ? `${h}h ${m}m` : `${m}m`; };
+  const fmtPace = (s) => `${Math.floor(s / 60)}:${String(Math.round(s % 60)).padStart(2, '0')}`;
+  const avgOfArr = (arr) => arr.length ? Math.round(arr.reduce((a, b) => a + b) / arr.length) : null;
+
+  // ── Totals ──
+  const totalSec = thisWeek.reduce((s, a) => s + (a.moving_time_s ?? 0), 0);
+  const totalCal = thisWeek.reduce((s, a) => s + (a.raw?.calories ?? 0), 0);
+
+  // ── Per activity type ──
+  const byType = {};
+  for (const a of thisWeek) {
+    const t = a.raw?.sport_type ?? a.type ?? 'Unknown';
+    if (!byType[t]) byType[t] = [];
+    byType[t].push(a);
+  }
+
+  // ── Easy run HR trend ──
+  const isEasyRun = (a) => (a.raw?.sport_type ?? a.type) === 'Run' && a.raw?.average_heartrate && a.raw.average_heartrate < 155;
+  const easyHRAvg = (acts) => avgOfArr(acts.filter(isEasyRun).map(a => a.raw.average_heartrate).filter(Boolean));
+  const thisAvgHR  = easyHRAvg(thisWeek);
+  const lastAvgHR  = easyHRAvg(week1);
+  const prev2AvgHR = easyHRAvg(week2);
+  const easyThis   = thisWeek.filter(isEasyRun);
+  const lowestHR   = easyThis.length ? Math.round(Math.min(...easyThis.map(a => a.raw.average_heartrate))) : null;
+  const highestHR  = easyThis.length ? Math.round(Math.max(...easyThis.map(a => a.raw?.max_heartrate ?? 0).filter(Boolean))) : null;
+
+  // ── Best run scoring ──
+  const best = bestRunOfWeek(thisWeek);
+  const pastBests = [week1, week2, week3, week4].map(w => bestRunOfWeek(w)).filter(x => x?.s);
+  const thisScore = best?.s?.score ?? 0;
+  const isBestInMonth = pastBests.length > 0 && pastBests.every(x => thisScore > x.s.score);
+
+  // ── Build report ──
+  const lines = [];
+  const weekLabel = now.toLocaleDateString('en-GB', { day: 'numeric', month: 'short', timeZone: 'Asia/Jerusalem' });
+  lines.push(`📊 Weekly Report — w/e ${weekLabel}`);
+  lines.push(`⏱ Total active time: ${fmtTime(totalSec)} | 🔥 ${totalCal} kcal`);
+  lines.push('');
+
+  const typeEmoji = { Run: '🏃', Ride: '🚴', Swim: '🏊', Walk: '🚶', Hike: '🥾', WeightTraining: '🏋️', Tennis: '🎾', Yoga: '🧘', Workout: '💪' };
+  for (const [type, acts] of Object.entries(byType).sort()) {
+    const emoji  = typeEmoji[type] ?? '🏅';
+    const sec    = acts.reduce((s, a) => s + (a.moving_time_s ?? 0), 0);
+    const cal    = acts.reduce((s, a) => s + (a.raw?.calories ?? 0), 0);
+    const hrActs = acts.filter(a => a.raw?.has_heartrate && a.raw?.average_heartrate);
+    const avgHR  = avgOfArr(hrActs.map(a => a.raw.average_heartrate));
+    lines.push(`${emoji} ${type}: ${acts.length}x | ${fmtTime(sec)}${cal > 0 ? ` | ${cal} kcal` : ''}${avgHR ? ` | avg HR ${avgHR} bpm` : ''}`);
+  }
+
+  // ── Best run ──
+  lines.push('');
+  if (best) {
+    const br = best.a, bs = best.s;
+    const date = new Date(br.started_at).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', timeZone: 'Asia/Jerusalem' });
+    if (bs) {
+      lines.push(`⭐ Best run: ${date} · ${bs.distKm.toFixed(1)}km · ${fmtPace(bs.paceSecPerKm)}/km · HR ${bs.avgHR ?? '—'}bpm · Score ${bs.score.toFixed(1)}`);
+
+      // Compare to past 4 weeks
+      const comparisons = pastBests.map((x, i) => {
+        const diff = bs.score - x.s.score;
+        return `${diff > 0 ? '+' : ''}${diff.toFixed(1)} vs ${i + 1}w ago`;
+      });
+      if (comparisons.length) lines.push(`   ↳ ${comparisons.join(' | ')}`);
+      if (isBestInMonth) lines.push(`   🏆 Best performance score in the past month`);
+    } else {
+      const date2 = new Date(br.started_at).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', timeZone: 'Asia/Jerusalem' });
+      lines.push(`⭐ Best run: ${date2} · ${((br.distance_m ?? 0) / 1000).toFixed(1)}km`);
+    }
+  } else {
+    lines.push(`⭐ No runs recorded this week`);
+  }
+
+  // ── PRs (fully independent of score) ──
+  const runsWithPRs = thisWeek.filter(a => (a.raw?.sport_type ?? a.type) === 'Run' && (a.raw?.pr_count ?? 0) > 0);
+  if (runsWithPRs.length) {
+    lines.push('');
+    lines.push(`🎯 PRs this week:`);
+    for (const r of runsWithPRs) {
+      const d = new Date(r.started_at).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', timeZone: 'Asia/Jerusalem' });
+      const km = ((r.distance_m ?? 0) / 1000).toFixed(1);
+      const pace = r.raw?.average_speed ? fmtPace(1000 / r.raw.average_speed) : '—';
+      lines.push(`   ${r.raw?.pr_count} PR${r.raw.pr_count > 1 ? 's' : ''} — ${r.raw?.name ?? 'Run'} on ${d} (${km}km, ${pace}/km)`);
+    }
+  }
+
+  // ── Easy run HR ──
+  lines.push('');
+  lines.push('💓 Easy run HR:');
+  if (thisAvgHR && easyThis.length) {
+    lines.push(`${easyThis.length} run${easyThis.length > 1 ? 's' : ''} · avg ${thisAvgHR} · low ${lowestHR} · high ${highestHR} bpm`);
+    const trendParts = [];
+    if (lastAvgHR)  trendParts.push(`${thisAvgHR - lastAvgHR > 0 ? '+' : ''}${thisAvgHR - lastAvgHR} bpm vs last week`);
+    if (prev2AvgHR) trendParts.push(`${thisAvgHR - prev2AvgHR > 0 ? '+' : ''}${thisAvgHR - prev2AvgHR} bpm vs 2 weeks ago`);
+    if (trendParts.length) lines.push(`📈 ${trendParts.join(' | ')}`);
+    if (lastAvgHR) {
+      const diff = thisAvgHR - lastAvgHR;
+      if (diff < -2)     lines.push(`✅ HR trending down — fitness improving`);
+      else if (diff > 3) lines.push(`⚠️ HR trending up — monitor sleep & recovery`);
+      else               lines.push(`➡️ HR stable week over week`);
+    }
+  } else {
+    lines.push('No easy runs this week');
+  }
+
+  // ── Weekly nutrition from MFP ──
+  const nutritionRows = [];
+  for (let i = 1; i <= 7; i++) {
+    const d = new Date(now - i * 86400000).toISOString().slice(0, 10);
+    const row = await getStoredNutrition(d);
+    if (row?.calories) nutritionRows.push(row);
+  }
+  if (nutritionRows.length) {
+    const avgCal  = Math.round(nutritionRows.reduce((s, r) => s + r.calories, 0) / nutritionRows.length);
+    const avgProt = Math.round(nutritionRows.reduce((s, r) => s + (r.protein_g ?? 0), 0) / nutritionRows.length);
+    const avgCarb = Math.round(nutritionRows.reduce((s, r) => s + (r.carbs_g ?? 0), 0) / nutritionRows.length);
+    const avgFat  = Math.round(nutritionRows.reduce((s, r) => s + (r.fat_g ?? 0), 0) / nutritionRows.length);
+    lines.push('');
+    lines.push(`🍽 Nutrition (${nutritionRows.length}-day avg): ${avgCal} kcal · P ${avgProt}g · C ${avgCarb}g · F ${avgFat}g`);
+  }
+
+  lines.push('');
+  lines.push('📋 TrainingPeaks: coming soon');
+
+  return lines.join('\n');
+}
+
+// Weekly report every Saturday at 9:00pm Israel time
+cron.schedule('0 21 * * 6', async () => {
+  console.log('[weekly] Sending weekly report');
+  try {
+    const message = await generateWeeklyReport();
+    await sendTelegram(process.env.TELEGRAM_OWNER_CHAT_ID, message);
+    console.log('[weekly] Sent successfully');
+  } catch (err) {
+    console.error('[weekly] Error:', err.message);
+  }
+}, { timezone: 'Asia/Jerusalem' });
+
+// Daily briefing at 7:00am Israel time
+cron.schedule('0 7 * * *', async () => {
+  console.log('[briefing] Sending morning briefing');
+  try {
+    const message = await generateMorningBriefing();
+    await sendTelegram(process.env.TELEGRAM_OWNER_CHAT_ID, message);
+    console.log('[briefing] Sent successfully');
+  } catch (err) {
+    console.error('[briefing] Error:', err.message);
+  }
+}, { timezone: 'Asia/Jerusalem' });
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Listening on port ${PORT}`));
