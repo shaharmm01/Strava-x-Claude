@@ -88,6 +88,7 @@ app.get('/auth/strava/callback', async (req, res) => {
   res.send('Strava connected! You can close this tab.');
 });
 
+
 // Strava webhook verification — Strava GETs this URL with hub.challenge before activating
 app.get('/webhook/strava/:secret', (req, res) => {
   if (req.params.secret !== process.env.COMPOSIO_WEBHOOK_SECRET) {
@@ -491,6 +492,69 @@ async function getStoredNutrition(dateStr) {
   return data ?? null;
 }
 
+async function fetchTrainingPeaksEmail() {
+  const connectionId = process.env.COMPOSIO_GMAIL_CONNECTION_ID;
+  if (!connectionId) throw new Error('COMPOSIO_GMAIL_CONNECTION_ID not set');
+
+  const res = await fetch('https://backend.composio.dev/api/v3/actions/GMAIL_FETCH_EMAILS/execute', {
+    method: 'POST',
+    headers: { 'x-api-key': process.env.COMPOSIO_API_KEY, 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      connectedAccountId: connectionId,
+      input: { user_id: 'me', query: 'from:noreply@trainingpeaks.com newer_than:1d', max_results: 3 },
+    }),
+  });
+  if (!res.ok) throw new Error(`Composio Gmail HTTP ${res.status}`);
+  const data = await res.json();
+  return data?.data?.messages ?? data?.response?.data?.messages ?? [];
+}
+
+async function parseTrainingPeaksEmail(emailBody) {
+  const response = await anthropic.messages.create({
+    model: 'claude-sonnet-4-6',
+    max_tokens: 300,
+    system: 'Extract workout details from a TrainingPeaks email. Reply with JSON only, no explanation.',
+    messages: [{
+      role: 'user',
+      content: `Extract from this TrainingPeaks email and return JSON with keys: workout_type, duration_min (integer), distance_km (number or null), hr_zones (string or null), coach_notes (string or null).
+
+Email:
+${emailBody.slice(0, 3000)}`,
+    }],
+  });
+  try {
+    const text = response.content[0].text.replace(/```json|```/g, '').trim();
+    return JSON.parse(text);
+  } catch {
+    return null;
+  }
+}
+
+async function fetchAndStoreTodayPlan() {
+  const today = new Date().toISOString().slice(0, 10);
+  try {
+    const messages = await fetchTrainingPeaksEmail();
+    if (!messages.length) { console.log('[tp] No TrainingPeaks email found'); return null; }
+
+    const body = messages[0]?.body?.content ?? messages[0]?.snippet ?? messages[0]?.body ?? '';
+    const parsed = await parseTrainingPeaksEmail(body);
+    if (!parsed) { console.log('[tp] Could not parse email'); return null; }
+
+    await supabase.from('planned_sessions').upsert({ date: today, ...parsed, raw_email: body.slice(0, 5000) });
+    console.log(`[tp] Stored plan for ${today}: ${parsed.workout_type}`);
+    return parsed;
+  } catch (err) {
+    console.error('[tp] Error:', err.message);
+    return null;
+  }
+}
+
+async function getTodayPlan() {
+  const today = new Date().toISOString().slice(0, 10);
+  const { data } = await supabase.from('planned_sessions').select('*').eq('date', today).single();
+  return data ?? null;
+}
+
 async function generateMorningBriefing() {
   const forecast = await getWeatherForecast();
   const { sunrise, sunset } = calculateSunriseSunset();
@@ -502,19 +566,20 @@ async function generateMorningBriefing() {
     system: 'You are an expert endurance coach sending a concise daily morning briefing. Use metric units. No markdown, just clean text with line breaks.',
     messages: [{
       role: 'user',
-      content: `Generate a morning briefing for an athlete in ${process.env.RUNNER_LOCATION}.
+      content: `Today is ${new Date().toLocaleDateString('en-GB', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' })}.
+Location: ${process.env.RUNNER_LOCATION}
 
 Weather forecast (next 48h):
 ${forecast}
 
 Sunrise: ${fmt(sunrise)}, Sunset: ${fmt(sunset)}
 
-Include:
+Generate a morning briefing. Include:
 1. One-line weather summary for today
 2. Best 1-2 hour window to run today (based on temperature, wind, rain, and daylight)
 3. Any heat/rain/wind warnings if relevant
 
-Keep it under 150 words. Start with the date.`,
+Keep it under 150 words. Start with today's date.`,
     }],
   });
 
@@ -525,7 +590,17 @@ Keep it under 150 words. Start with the date.`,
     nutritionLine = `\n\n🍽 Yesterday's nutrition: ${nutrition.calories} kcal · P ${nutrition.protein_g}g · C ${nutrition.carbs_g}g · F ${nutrition.fat_g}g`;
   }
 
-  return `🌅 Morning Briefing\n\n${response.content[0].text}${nutritionLine}\n\n— Garmin recovery & TrainingPeaks coming soon`;
+  const plan = await getTodayPlan();
+  let planLine = '\n\n📋 Coach plan today: Rest day or check TrainingPeaks manually';
+  if (plan?.workout_type) {
+    const parts = [plan.workout_type];
+    if (plan.duration_min) parts.push(`${plan.duration_min} min`);
+    if (plan.distance_km)  parts.push(`${plan.distance_km} km`);
+    if (plan.coach_notes)  parts.push(plan.coach_notes);
+    planLine = `\n\n📋 Coach plan today: ${parts.join(' · ')}`;
+  }
+
+  return `🌅 Morning Briefing\n\n${response.content[0].text}${nutritionLine}${planLine}\n\n— Garmin recovery coming soon`;
 }
 
 function getEffortMultiplier(paceSecPerKm) {
@@ -735,6 +810,12 @@ cron.schedule('0 21 * * 6', async () => {
   } catch (err) {
     console.error('[weekly] Error:', err.message);
   }
+}, { timezone: 'Asia/Jerusalem' });
+
+// Fetch TrainingPeaks email at 6:00am so it's ready for the 7am briefing
+cron.schedule('0 6 * * *', async () => {
+  console.log('[tp] Fetching daily TrainingPeaks plan');
+  await fetchAndStoreTodayPlan();
 }, { timezone: 'Asia/Jerusalem' });
 
 // Daily briefing at 7:00am Israel time
