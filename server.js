@@ -27,6 +27,8 @@ app.get('/briefing/:secret', async (req, res) => {
   try {
     const message = await generateMorningBriefing();
     await sendTelegram(process.env.TELEGRAM_OWNER_CHAT_ID, message);
+    const recovery = await getActiveRecoverySession();
+    if (recovery?.status === 'active') await sendMorningPainCheck();
     console.log('[briefing] Manual trigger sent');
   } catch (err) {
     console.error('[briefing] Manual trigger error:', err.message);
@@ -243,6 +245,46 @@ app.get('/backfill/:secret', async (req, res) => {
   }
 });
 
+// Manual overtraining check trigger
+app.get('/overtraining/:secret', async (req, res) => {
+  if (req.params.secret !== process.env.COMPOSIO_WEBHOOK_SECRET) return res.status(401).send('Unauthorized');
+  res.status(200).send('Overtraining check triggered');
+  try {
+    const message = await checkOvertraining();
+    await sendTelegram(process.env.TELEGRAM_OWNER_CHAT_ID, message);
+  } catch (err) {
+    console.error('[overtraining] Manual trigger error:', err.message);
+  }
+});
+
+// Hevy CSV import: POST /import/hevy/:secret
+// Body: raw CSV text — curl -X POST "URL/import/hevy/SECRET" -H "Content-Type: text/plain" --data-binary @workout_data.csv
+app.post('/import/hevy/:secret', express.text({ type: '*/*', limit: '10mb' }), async (req, res) => {
+  if (req.params.secret !== process.env.COMPOSIO_WEBHOOK_SECRET) return res.status(401).send('Unauthorized');
+  try {
+    const rows = parseHevyCSV(req.body);
+    const workouts = groupHevyWorkouts(rows);
+    let upserted = 0;
+    for (const w of workouts) {
+      await supabase.from('hevy_workouts').delete().eq('workout_date', w.workout_date).eq('workout_title', w.title);
+      const { error } = await supabase.from('hevy_workouts').insert({
+        workout_date: w.workout_date,
+        workout_title: w.title,
+        start_time: w.start_time,
+        end_time: w.end_time,
+        exercises: w.exercises,
+      });
+      if (error) console.error('[hevy] Insert error:', error.message);
+      else upserted++;
+    }
+    console.log(`[hevy] Imported ${upserted} workouts`);
+    res.json({ imported: upserted, workouts: workouts.map(w => ({ title: w.title, date: w.workout_date, exercises: w.exercises.length })) });
+  } catch (err) {
+    console.error('[hevy] Import error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // Telegram webhook — verified via X-Telegram-Bot-Api-Secret-Token header
 app.post('/webhook/telegram', (req, res) => {
   const token = req.headers['x-telegram-bot-api-secret-token'];
@@ -260,9 +302,27 @@ app.post('/webhook/telegram', (req, res) => {
   const chatId = msg.chat.id;
   console.log('[telegram] Message from chat', chatId);
 
-  getCoachingResponse(msg.text)
-    .then((reply) => sendTelegram(chatId, reply))
-    .catch((err) => console.error('[telegram] Handler error:', err.message));
+  const text = msg.text ?? '';
+  if (/^\/pain\s+/i.test(text)) {
+    handlePainLog(chatId, text).catch(err => console.error('[pain] Error:', err.message));
+  } else if (/^\/injuries$/i.test(text)) {
+    handleInjuries(chatId).catch(err => console.error('[injuries] Error:', err.message));
+  } else if (/^\/return$/i.test(text)) {
+    handleReturnCommand(chatId).catch(err => console.error('[return] Error:', err.message));
+  } else {
+    getBotState('conversation').then(state => {
+      if (state?.step) {
+        handleConversationReply(chatId, text, state).catch(err => console.error('[conv] Error:', err.message));
+      } else {
+        getCoachingResponse(text)
+          .then((reply) => sendTelegram(chatId, reply))
+          .catch((err) => console.error('[telegram] Handler error:', err.message));
+      }
+    }).catch(err => {
+      console.error('[state] Error:', err.message);
+      getCoachingResponse(text).then(r => sendTelegram(chatId, r)).catch(() => {});
+    });
+  }
 });
 
 async function sendTelegram(chatId, text) {
@@ -555,18 +615,447 @@ async function getTodayPlan() {
   return data ?? null;
 }
 
+function parsePainCommand(input) {
+  // "left knee 6/10 sharp after long run"
+  const match = input.match(/^(.+?)\s+(\d+)\/10\s*(.*)?$/i);
+  if (!match) return null;
+  const level = parseInt(match[2]);
+  if (level < 1 || level > 10) return null;
+  return { body_part: match[1].trim(), pain_level: level, description: match[3]?.trim() || null };
+}
+
+async function check3DayWarning(bodyPart) {
+  const twoDaysAgo = new Date(Date.now() - 2 * 86400000).toISOString().slice(0, 10);
+  const today = new Date().toISOString().slice(0, 10);
+  const { data } = await supabase.from('pain_log').select('date').eq('body_part', bodyPart).gte('date', twoDaysAgo).lte('date', today);
+  const uniqueDates = [...new Set((data ?? []).map(r => r.date))];
+  return uniqueDates.length >= 3;
+}
+
+async function handlePainLog(chatId, text) {
+  const input = text.replace(/^\/pain\s+/i, '').trim();
+  const parsed = parsePainCommand(input);
+  if (!parsed) {
+    await sendTelegram(chatId, 'Format: /pain [body part] [level]/10 [description]\nExample: /pain left knee 6/10 sharp after long run');
+    return;
+  }
+  const today = new Date().toISOString().slice(0, 10);
+  const { data: recentActs } = await supabase.from('activities').select('strava_id, raw').order('started_at', { ascending: false }).limit(1);
+  const precedingId = recentActs?.[0]?.strava_id ?? null;
+  const activityName = recentActs?.[0]?.raw?.name ?? null;
+
+  const { error } = await supabase.from('pain_log').insert({
+    date: today,
+    logged_at: new Date().toISOString(),
+    body_part: parsed.body_part,
+    pain_level: parsed.pain_level,
+    description: parsed.description,
+    preceding_activity_id: precedingId,
+  });
+
+  if (error) { await sendTelegram(chatId, 'Failed to log pain — try again.'); return; }
+
+  let reply = `🩹 Logged: ${parsed.body_part} ${parsed.pain_level}/10${parsed.description ? ` — ${parsed.description}` : ''}`;
+  if (activityName) reply += `\nPreceding activity: ${activityName}`;
+
+  const warn = await check3DayWarning(parsed.body_part);
+  if (warn) reply += `\n\n⚠️ ${parsed.body_part} logged 3 days in a row.`;
+
+  await sendTelegram(chatId, reply);
+
+  // Activate recovery mode if significant pain or 3-day streak
+  const shouldActivate = parsed.pain_level >= 6 || warn;
+  if (shouldActivate) {
+    const existing = await getActiveRecoverySession();
+    const alreadyActive = existing && existing.body_part.toLowerCase() === parsed.body_part.toLowerCase();
+    if (!alreadyActive) await activateRecoveryMode(chatId, parsed.body_part);
+  }
+}
+
+async function handleInjuries(chatId) {
+  const sevenDaysAgo = new Date(Date.now() - 7 * 86400000).toISOString().slice(0, 10);
+  const thirtyDaysAgo = new Date(Date.now() - 30 * 86400000).toISOString().slice(0, 10);
+
+  const { data: active } = await supabase.from('pain_log').select('*').gte('date', sevenDaysAgo).order('date', { ascending: false });
+  const { data: history } = await supabase.from('pain_log').select('*').gte('date', thirtyDaysAgo).lt('date', sevenDaysAgo).order('date', { ascending: false });
+
+  const lines = ['🩹 Injury Log'];
+  if (active?.length) {
+    lines.push('\nActive (last 7 days):');
+    for (const r of active) lines.push(`  ${r.date} · ${r.body_part} ${r.pain_level}/10${r.description ? ` — ${r.description}` : ''}`);
+  } else {
+    lines.push('\nNo active issues in the last 7 days. ✅');
+  }
+  if (history?.length) {
+    lines.push('\nHistory (8–30 days ago):');
+    for (const r of history) lines.push(`  ${r.date} · ${r.body_part} ${r.pain_level}/10${r.description ? ` — ${r.description}` : ''}`);
+  }
+  await sendTelegram(chatId, lines.join('\n'));
+}
+
+async function getActivePainSummary() {
+  const threeDaysAgo = new Date(Date.now() - 3 * 86400000).toISOString().slice(0, 10);
+  const { data } = await supabase.from('pain_log').select('body_part, pain_level').gte('date', threeDaysAgo);
+  if (!data?.length) return null;
+  const best = {};
+  for (const r of data) {
+    if (!best[r.body_part] || r.pain_level > best[r.body_part]) best[r.body_part] = r.pain_level;
+  }
+  return Object.entries(best).map(([part, lvl]) => `${part} ${lvl}/10`).join(', ');
+}
+
+// ── Recovery Mode ─────────────────────────────────────────────────────────────
+
+async function getActiveRecoverySession() {
+  const { data } = await supabase.from('recovery_sessions').select('*').in('status', ['intake', 'active', 'returned']).order('created_at', { ascending: false }).limit(1);
+  return data?.[0] ?? null;
+}
+
+async function getBotState(key) {
+  const { data } = await supabase.from('bot_state').select('value').eq('key', key).single();
+  return data?.value ?? null;
+}
+
+async function setBotState(key, value) {
+  await supabase.from('bot_state').upsert({ key, value, updated_at: new Date().toISOString() });
+}
+
+function getAlternativeActivities(bodyPart) {
+  const bp = (bodyPart ?? '').toLowerCase();
+  if (/knee|it.band|quad|hamstring/.test(bp)) return 'Swimming, upper body strength (avoid leg press)';
+  if (/soleus|ankle|foot|calf|achilles|shin/.test(bp)) return 'Swimming, upper body strength, seated cycling (low resistance only)';
+  if (/hip|glute/.test(bp)) return 'Swimming, upper body strength, easy walking';
+  if (/back/.test(bp)) return 'Easy walking, swimming, gentle core work';
+  if (/shoulder|arm|elbow/.test(bp)) return 'Cycling, lower body strength, running if pain-free';
+  return 'Swimming, cycling, strength training';
+}
+
+async function getPainTrend(bodyPart) {
+  const { data } = await supabase.from('pain_log').select('pain_level, date').eq('body_part', bodyPart).order('date', { ascending: false }).limit(4);
+  if (!data || data.length < 2) return null;
+  if (data[0].pain_level < data[1].pain_level) return 'improving';
+  if (data[0].pain_level > data[1].pain_level) return 'worsening';
+  return 'stable';
+}
+
+async function checkGreenLight(bodyPart) {
+  const threeDaysAgo = new Date(Date.now() - 2 * 86400000).toISOString().slice(0, 10);
+  const { data } = await supabase.from('pain_log').select('pain_level, date').eq('body_part', bodyPart).gte('date', threeDaysAgo);
+  if (!data?.length) return false;
+  const byDate = {};
+  for (const r of data) { if (!byDate[r.date] || r.pain_level > byDate[r.date]) byDate[r.date] = r.pain_level; }
+  const dates = Object.keys(byDate).sort().reverse();
+  return dates.length >= 3 && dates.slice(0, 3).every(d => byDate[d] < 3);
+}
+
+function generateRecoveryRecommendation(painType, worseTiming) {
+  if (painType === 'sharp' && worseTiming === 'during') return 'Rest completely — no running or high-impact until pain-free for 48h';
+  if (painType === 'sharp') return 'Cross-train only (swim/bike) — no running until pain-free for 48h';
+  if (worseTiming === 'during') return 'Cross-train only — switch to swimming or cycling until symptom-free';
+  if (painType === 'burning') return 'Reduce volume by 40% — easy pace only, stop if burning returns';
+  return 'Reduce volume by 30% — keep all runs easy, monitor closely';
+}
+
+function generateReturnPlan(daysOut) {
+  if (daysOut >= 14) {
+    return 'Week 1: Walk-run intervals — 1 min run / 2 min walk × 20 min, 3×/week\nWeek 2: Easy continuous runs at 50% normal volume\nWeek 3: Build to 75% if pain-free\nWeek 4: Full return — add one quality session only if symptom-free';
+  }
+  if (daysOut >= 7) {
+    return 'Days 1–2: 20–25 min very easy (conversational pace)\nDays 3–4: 30–35 min easy\nDays 5–7: Resume full easy schedule\nWeek 2: Add one moderate session if pain-free';
+  }
+  return 'Days 1–2: 25–30 min easy (comfortable pace)\nDays 3–4: 35–40 min easy, normal effort\nDay 5+: Resume normal training if fully pain-free';
+}
+
+async function activateRecoveryMode(chatId, bodyPart) {
+  const { data } = await supabase.from('recovery_sessions').insert({
+    body_part: bodyPart,
+    status: 'intake',
+    started_at: new Date().toISOString().slice(0, 10),
+  }).select().single();
+  if (!data) return;
+  await setBotState('conversation', { step: 'pain_type', session_id: data.id, body_part: bodyPart });
+  await sendTelegram(chatId,
+    `🔴 Recovery mode activated for ${bodyPart}.\n\nI have 3 quick questions to build your protocol.\n\nQ1/3: What type of pain is it?\nReply: sharp, dull, or burning`
+  );
+}
+
+async function handleConversationReply(chatId, text, state) {
+  const answer = text.trim().toLowerCase();
+  const today = new Date().toISOString().slice(0, 10);
+
+  if (state.step === 'morning_pain_check' || state.step === 'evening_pain_check') {
+    const level = parseInt(text.trim());
+    if (isNaN(level) || level < 1 || level > 10) {
+      await sendTelegram(chatId, 'Please reply with a number between 1 and 10.'); return;
+    }
+    const isEvening = state.step === 'evening_pain_check';
+    await supabase.from('pain_log').insert({
+      date: today, logged_at: new Date().toISOString(),
+      body_part: 'soleus', pain_level: level,
+      description: isEvening ? 'evening check-in' : 'morning check-in',
+      check_type: isEvening ? 'evening' : 'morning',
+    });
+    await setBotState('conversation', null);
+
+    if (isEvening) {
+      await sendTelegram(chatId, `Noted — soleus ${level}/10 this evening. Rest well tonight.`);
+      return;
+    }
+
+    // Morning branching
+    await checkPainTrend();
+    if (level <= 3) {
+      await sendTelegram(chatId,
+        `Great progress. Light stretching today is enough:\n\n• Bent knee wall stretch — 3 × 45 sec each leg\n• Ankle circles — 20 each direction\n• Foam roll lower calf — 60 sec each leg (avoid shin bone)\n\nKeep the momentum.`
+      );
+    } else if (level <= 6) {
+      await setBotState('conversation', { step: 'strengthening_confirm', pain_level: level });
+      await sendTelegram(chatId,
+        `Still some discomfort. Strengthening exercises will actually help speed recovery by rebuilding the soleus tissue.\n\nWant to do today's strengthening program?\nReply: yes or no`
+      );
+    } else {
+      await sendTelegram(chatId,
+        `High pain today. Skip all strengthening.\n\nGentle stretching only:\n• Bent knee calf stretch against wall — 3 × 45 sec each leg\n• Seated towel soleus stretch — 3 × 45 sec each foot\n• Ankle circles — 20 each direction\n• Foam roll lower calf — 60 sec each leg (avoid shin bone)\n\n🧊 Ice the shin for 15 minutes.\n\nRest as much as possible today.`
+      );
+      await checkHighPainStreak();
+    }
+    return;
+  }
+
+  if (state.step === 'strengthening_confirm') {
+    if (/^y(es)?$/i.test(answer)) {
+      await setBotState('conversation', null);
+      const strength = SOLEUS_STRENGTHENING.map(e => `• ${e}`).join('\n');
+      const stretch = SOLEUS_STRETCHING.map(e => `• ${e}`).join('\n');
+      await sendTelegram(chatId,
+        `Full program:\n\nStrengthening:\n${strength}\n\n🧊 Ice shin 15 min after strengthening\n\nStretching:\n${stretch}`
+      );
+    } else if (/^no?$/i.test(answer)) {
+      await setBotState('conversation', null);
+      const stretch = SOLEUS_STRETCHING.map(e => `• ${e}`).join('\n');
+      await sendTelegram(chatId, `Stretching only:\n\n${stretch}`);
+    } else {
+      await sendTelegram(chatId, 'Reply yes or no.');
+    }
+    return;
+  }
+
+  if (state.step === 'pain_type') {
+    const painType = ['sharp', 'dull', 'burning'].find(v => answer.includes(v));
+    if (!painType) { await sendTelegram(chatId, 'Please reply with: sharp, dull, or burning'); return; }
+    await supabase.from('recovery_sessions').update({ pain_type: painType }).eq('id', state.session_id);
+    await setBotState('conversation', { ...state, step: 'duration', pain_type: painType });
+    await sendTelegram(chatId, 'Q2/3: How long has it been there?\n(e.g. "since yesterday", "3 days", "2 weeks")');
+
+  } else if (state.step === 'duration') {
+    await supabase.from('recovery_sessions').update({ duration_description: text.trim() }).eq('id', state.session_id);
+    await setBotState('conversation', { ...state, step: 'worse_timing' });
+    await sendTelegram(chatId, 'Q3/3: Does it get worse during or after running?\nReply: during, after, both, or neither');
+
+  } else if (state.step === 'worse_timing') {
+    const timing = ['during', 'after', 'both', 'neither'].find(v => answer.includes(v));
+    if (!timing) { await sendTelegram(chatId, 'Please reply: during, after, both, or neither'); return; }
+    const rec = generateRecoveryRecommendation(state.pain_type, timing);
+    await supabase.from('recovery_sessions').update({ worse_timing: timing, recommendation: rec, status: 'active' }).eq('id', state.session_id);
+    await setBotState('conversation', null);
+    const alts = getAlternativeActivities(state.body_part);
+    await sendTelegram(chatId,
+      `📋 Recovery Protocol — ${state.body_part}:\n\n${rec}\n\n💪 Alternative activities: ${alts}\n\nLog pain daily with /pain. I'll track your trend and tell you when you can return to running. Type /return when you're ready to start your comeback.`
+    );
+  }
+}
+
+async function handleReturnCommand(chatId) {
+  const session = await getActiveRecoverySession();
+  if (!session || session.status === 'intake') {
+    await sendTelegram(chatId, 'No active recovery session. Log pain first with /pain.'); return;
+  }
+  if (session.status === 'returned') {
+    const returnDay = Math.floor((Date.now() - new Date(session.return_started_at).getTime()) / 86400000) + 1;
+    await sendTelegram(chatId, `You're already on Day ${returnDay} of your return plan at ${session.return_volume_pct}% volume. Keep going — stop if pain rises above 3/10.`); return;
+  }
+  const daysOut = Math.floor((Date.now() - new Date(session.started_at).getTime()) / 86400000);
+  const pct = daysOut < 7 ? 60 : daysOut <= 14 ? 40 : 20;
+  const plan = generateReturnPlan(daysOut);
+  await supabase.from('recovery_sessions').update({ status: 'returned', return_started_at: new Date().toISOString().slice(0, 10), days_out: daysOut, return_volume_pct: pct }).eq('id', session.id);
+  await sendTelegram(chatId, `🏃 Return-to-Running Plan\n\n${daysOut} day${daysOut !== 1 ? 's' : ''} out → starting at ${pct}% volume\n\n${plan}\n\nLog your pain after each run with /pain. Stop and rest if pain rises above 3/10.`);
+}
+
+async function getRecoveryBriefing(session) {
+  const daysElapsed = Math.floor((Date.now() - new Date(session.started_at).getTime()) / 86400000);
+  const daysManaging = daysElapsed + 1;
+
+  // Auto-switch to return-to-running after 14-day rest phase
+  if (session.status === 'active' && daysElapsed >= 14) {
+    const today = new Date().toISOString().slice(0, 10);
+    await supabase.from('recovery_sessions').update({
+      status: 'returned', return_started_at: today, days_out: daysElapsed, return_volume_pct: 20,
+    }).eq('id', session.id);
+    session = { ...session, status: 'returned', return_started_at: today, days_out: daysElapsed, return_volume_pct: 20 };
+    sendTelegram(process.env.TELEGRAM_OWNER_CHAT_ID,
+      `🟢 14-day rest phase complete!\n\nSwitching to return-to-running at 20% volume.\n\n${generateReturnPlan(daysElapsed)}`
+    ).catch(() => {});
+  }
+
+  const trend = await getPainTrend(session.body_part);
+  const greenLight = session.status !== 'returned' ? await checkGreenLight(session.body_part) : false;
+  const trendMap = { improving: '📉 Improving', worsening: '📈 Worsening — ease back', stable: '➡️ Stable' };
+  const lines = [`🤕 Recovery — Day ${daysManaging} (${session.body_part})`];
+
+  if (session.status === 'active') {
+    const daysRemaining = Math.max(0, 14 - daysElapsed);
+    lines.push(`⏳ ${daysRemaining} day${daysRemaining !== 1 ? 's' : ''} remaining in no-run phase`);
+  }
+
+  if (trend) lines.push(`Pain trend: ${trendMap[trend]}`);
+  if (session.recommendation) lines.push(`Protocol: ${session.recommendation}`);
+  lines.push(`Today: ${getAlternativeActivities(session.body_part)}`);
+
+  if (session.status === 'returned') {
+    const returnDay = Math.floor((Date.now() - new Date(session.return_started_at).getTime()) / 86400000) + 1;
+    lines.push(`Return plan: Day ${returnDay} at ${session.return_volume_pct}% volume — walk-run intervals, stop if pain > 3/10`);
+  }
+
+  if (greenLight) lines.push(`\n🟢 3 consecutive days below 3/10 — you may be ready to return. Type /return to start your comeback plan.`);
+  return lines.join('\n');
+}
+
+async function checkOvertraining() {
+  const activeRecovery = await getActiveRecoverySession();
+  if (activeRecovery?.status === 'active') {
+    console.log('[overtraining] Skipping — athlete is in active recovery');
+    return null;
+  }
+  const now = new Date();
+  const weekStart  = new Date(now - 7  * 86400000);
+  const prevStart  = new Date(now - 14 * 86400000);
+  const prev2Start = new Date(now - 21 * 86400000);
+
+  const fetchActs = async (from, to) => {
+    let q = supabase.from('activities').select('type, distance_m, moving_time_s, started_at, raw').gte('started_at', from.toISOString());
+    if (to) q = q.lt('started_at', to.toISOString());
+    const { data } = await q;
+    return data ?? [];
+  };
+
+  const [thisWeek, prevWeek, prev2Week] = await Promise.all([
+    fetchActs(weekStart),
+    fetchActs(prevStart, weekStart),
+    fetchActs(prev2Start, prevStart),
+  ]);
+
+  const flags = [];
+
+  // 1. Weekly run distance increase > 10%
+  const runKm = (acts) => acts.filter(a => (a.raw?.sport_type ?? a.type) === 'Run').reduce((s, a) => s + (a.distance_m ?? 0) / 1000, 0);
+  const thisKm = runKm(thisWeek), prevKm = runKm(prevWeek);
+  if (prevKm > 0 && thisKm > prevKm * 1.1) {
+    flags.push(`🚨 Too much too soon: run distance jumped from ${prevKm.toFixed(1)}km to ${thisKm.toFixed(1)}km (+${Math.round((thisKm / prevKm - 1) * 100)}%). Scale back 10–15% next week.`);
+  }
+
+  // 2. Easy HR trending UP 2 weeks in a row
+  const isEasy = (a) => (a.raw?.sport_type ?? a.type) === 'Run' && a.raw?.average_heartrate && a.raw.average_heartrate < 155;
+  const easyAvgHR = (acts) => { const hrs = acts.filter(isEasy).map(a => a.raw.average_heartrate); return hrs.length ? hrs.reduce((a, b) => a + b) / hrs.length : null; };
+  const hr0 = easyAvgHR(thisWeek), hr1 = easyAvgHR(prevWeek), hr2 = easyAvgHR(prev2Week);
+  if (hr0 && hr1 && hr2 && hr0 > hr1 && hr1 > hr2) {
+    flags.push(`🚨 Elevated HR — possible fatigue: easy run HR rising 2 weeks straight (${Math.round(hr2)} → ${Math.round(hr1)} → ${Math.round(hr0)} bpm). Prioritise sleep and easy days.`);
+  }
+
+  // 3. 6+ training days, no rest day
+  const trainingDays = new Set(thisWeek.map(a => a.started_at.slice(0, 10))).size;
+  if (trainingDays >= 6) {
+    flags.push(`🚨 No recovery day detected: ${trainingDays} training days this week. Schedule at least 1 full rest day.`);
+  }
+
+  // 4. 3+ hard effort runs (score > 10)
+  const hardRuns = thisWeek.filter(a => { const s = scoreRun(a); return s && s.score > 10; });
+  if (hardRuns.length >= 3) {
+    flags.push(`🚨 Too many hard sessions: ${hardRuns.length} high-effort runs this week. Add easy/recovery days between hard efforts.`);
+  }
+
+  if (!flags.length) return '✅ Training load looks healthy this week. Keep it up!';
+  return `⚠️ Overtraining check — Monday ${now.toLocaleDateString('en-GB', { day: 'numeric', month: 'short' })}:\n\n${flags.join('\n\n')}`;
+}
+
+const SOLEUS_STRENGTHENING = [
+  'Bent knee calf raises — 3 × 15 reps (knee bent 45° to target soleus, not gastrocnemius)',
+  'Single leg bent knee calf raise — 3 × 10 each leg (slow & controlled)',
+  'Seated calf raises with weight on knee — 3 × 20 reps',
+  'Soleus wall sit hold — 3 × 45 sec',
+  'Toe walking — 3 × 30 sec',
+];
+
+const SOLEUS_STRETCHING = [
+  'Bent knee calf stretch against wall — 3 × 45 sec each leg (knee stays bent — targets soleus not gastrocnemius)',
+  'Seated towel soleus stretch — 3 × 45 sec each foot',
+  'Ankle circles — 20 each direction, each ankle',
+  'Plantar fascia massage with tennis ball — 2 min each foot',
+  'Foam roll lower calf/soleus — 60 sec each leg (avoid direct shin bone pressure)',
+];
+
+async function getRehabProgram(session) {
+  if (!session || !/soleus/i.test(session.body_part)) return null;
+
+  const daysElapsed = Math.floor((Date.now() - new Date(session.started_at).getTime()) / 86400000);
+  const dayNumber = daysElapsed + 1;
+  const today = new Date().toISOString().slice(0, 10);
+
+  // Check if pain > 7/10 was logged today
+  const { data: todayPain } = await supabase.from('pain_log').select('pain_level').ilike('body_part', '%soleus%').eq('date', today).order('pain_level', { ascending: false }).limit(1);
+  const maxPainToday = todayPain?.[0]?.pain_level ?? 0;
+
+  const forcedStretchOnly = maxPainToday > 7;
+  const stretchOnly = forcedStretchOnly || dayNumber % 2 === 0;
+
+  const label = forcedStretchOnly
+    ? `Day ${dayNumber} — pain logged above 7/10, stretching only today`
+    : stretchOnly
+      ? `Day ${dayNumber} — micro-recovery day, stretching only`
+      : `Day ${dayNumber} — full program`;
+
+  const lines = [`\n💪 Soleus Rehab — ${label}`];
+
+  if (!stretchOnly) {
+    lines.push('\nStrengthening:');
+    for (const ex of SOLEUS_STRENGTHENING) lines.push(`  • ${ex}`);
+    lines.push('\n🧊 Ice shin area for 15 min after strengthening exercises');
+    lines.push('\nStretching:');
+    for (const ex of SOLEUS_STRETCHING) lines.push(`  • ${ex}`);
+  } else {
+    lines.push('\nStretching:');
+    for (const ex of SOLEUS_STRETCHING) lines.push(`  • ${ex}`);
+  }
+
+  return lines.join('\n');
+}
+
 async function generateMorningBriefing() {
-  const forecast = await getWeatherForecast();
+  const [forecast, recoverySession] = await Promise.all([getWeatherForecast(), getActiveRecoverySession()]);
   const { sunrise, sunset } = calculateSunriseSunset();
   const fmt = (d) => d.toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit', timeZone: 'Asia/Jerusalem' });
+  const todayStr = new Date().toLocaleDateString('en-GB', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' });
+  const inNoRunPhase = recoverySession?.status === 'active';
 
-  const response = await anthropic.messages.create({
-    model: 'claude-sonnet-4-6',
-    max_tokens: 600,
-    system: 'You are an expert endurance coach sending a concise daily morning briefing. Use metric units. No markdown, just clean text with line breaks.',
-    messages: [{
-      role: 'user',
-      content: `Today is ${new Date().toLocaleDateString('en-GB', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' })}.
+  const system = inNoRunPhase
+    ? 'You are an expert coach. The athlete is in a strict NO-RUN recovery phase. Do NOT mention running at all. Suggest the best time for alternative training (swimming, cycling, walking, strength) based on the weather. Use metric units. No markdown.'
+    : 'You are an expert endurance coach sending a concise daily morning briefing. Use metric units. No markdown, just clean text with line breaks.';
+
+  const userContent = inNoRunPhase
+    ? `Today is ${todayStr}.
+Location: ${process.env.RUNNER_LOCATION}
+
+Weather forecast (next 48h):
+${forecast}
+
+Sunrise: ${fmt(sunrise)}, Sunset: ${fmt(sunset)}
+
+The athlete is in a no-run recovery phase. Give a brief morning briefing for alternative activities only. Include:
+1. One-line weather summary for today
+2. Best 1-2 hour window for outdoor alternatives (cycling, walking) — or indoor options (pool, gym) if weather is poor
+3. Any heat/wind warnings relevant to outdoor alternatives
+
+Keep it under 120 words. Start with today's date. Do NOT mention running.`
+    : `Today is ${todayStr}.
 Location: ${process.env.RUNNER_LOCATION}
 
 Weather forecast (next 48h):
@@ -579,8 +1068,13 @@ Generate a morning briefing. Include:
 2. Best 1-2 hour window to run today (based on temperature, wind, rain, and daylight)
 3. Any heat/rain/wind warnings if relevant
 
-Keep it under 150 words. Start with today's date.`,
-    }],
+Keep it under 150 words. Start with today's date.`;
+
+  const response = await anthropic.messages.create({
+    model: 'claude-sonnet-4-6',
+    max_tokens: 600,
+    system,
+    messages: [{ role: 'user', content: userContent }],
   });
 
   const yesterday = new Date(Date.now() - 86400000).toISOString().slice(0, 10);
@@ -590,17 +1084,32 @@ Keep it under 150 words. Start with today's date.`,
     nutritionLine = `\n\n🍽 Yesterday's nutrition: ${nutrition.calories} kcal · P ${nutrition.protein_g}g · C ${nutrition.carbs_g}g · F ${nutrition.fat_g}g`;
   }
 
-  const plan = await getTodayPlan();
-  let planLine = '\n\n📋 Coach plan today: Rest day or check TrainingPeaks manually';
-  if (plan?.workout_type) {
-    const parts = [plan.workout_type];
-    if (plan.duration_min) parts.push(`${plan.duration_min} min`);
-    if (plan.distance_km)  parts.push(`${plan.distance_km} km`);
-    if (plan.coach_notes)  parts.push(plan.coach_notes);
-    planLine = `\n\n📋 Coach plan today: ${parts.join(' · ')}`;
+  let planLine = '';
+  if (!inNoRunPhase) {
+    planLine = '\n\n📋 Coach plan today: Rest day or check TrainingPeaks manually';
+    const plan = await getTodayPlan();
+    if (plan?.workout_type) {
+      const parts = [plan.workout_type];
+      if (plan.duration_min) parts.push(`${plan.duration_min} min`);
+      if (plan.distance_km)  parts.push(`${plan.distance_km} km`);
+      if (plan.coach_notes)  parts.push(plan.coach_notes);
+      planLine = `\n\n📋 Coach plan today: ${parts.join(' · ')}`;
+    }
   }
 
-  return `🌅 Morning Briefing\n\n${response.content[0].text}${nutritionLine}${planLine}\n\n— Garmin recovery coming soon`;
+  let recoveryLine = '';
+  if (recoverySession) {
+    recoveryLine = `\n\n${await getRecoveryBriefing(recoverySession)}`;
+    if (inNoRunPhase) {
+      const rehab = await getRehabProgram(recoverySession);
+      if (rehab) recoveryLine += rehab;
+    }
+  } else {
+    const activePain = await getActivePainSummary();
+    if (activePain) recoveryLine = `\n\n⚠️ Active pain: ${activePain} — monitor today`;
+  }
+
+  return `🌅 Morning Briefing\n\n${response.content[0].text}${nutritionLine}${planLine}${recoveryLine}\n\n— Garmin recovery coming soon`;
 }
 
 function getEffortMultiplier(paceSecPerKm) {
@@ -651,6 +1160,134 @@ function bestRunOfWeek(activities) {
   return scored[0];
 }
 
+function parseHevyDescription(desc) {
+  const lines = desc.split('\n').map(l => l.trim()).filter(Boolean);
+  const exercises = [];
+  let current = null;
+  let sets = [];
+
+  for (const line of lines) {
+    if (line === 'Logged with Hevy') continue;
+    if (/^Set \d+:/i.test(line)) {
+      // e.g. "Set 1: 9 reps" or "Set 1: 9 reps @ 80 kg"
+      const match = line.match(/Set \d+:\s*(\d+)\s*reps?(?:\s*@\s*([\d.]+)\s*kg)?/i);
+      if (match) sets.push(match[2] ? `${match[1]}×${match[2]}kg` : match[1]);
+    } else {
+      // New exercise name
+      if (current) exercises.push(formatExercise(current, sets));
+      current = line;
+      sets = [];
+    }
+  }
+  if (current) exercises.push(formatExercise(current, sets));
+  return exercises;
+}
+
+function formatExercise(name, sets) {
+  if (!sets.length) return name;
+  // Group identical sets: e.g. "3×80kg" or mixed "9/7/8/7 reps"
+  const allHaveWeight = sets.every(s => s.includes('kg'));
+  if (allHaveWeight) {
+    // Show as "Bench Press: 4 sets · 9×80kg / 7×80kg"
+    return `${name}: ${sets.length} sets · ${sets.join(' / ')}`;
+  }
+  // Body weight — show reps only
+  return `${name}: ${sets.length} sets · ${sets.join('/')} reps`;
+}
+
+function parseCSVLine(line) {
+  const result = [];
+  let current = '';
+  let inQuotes = false;
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+    if (ch === '"') {
+      if (inQuotes && line[i + 1] === '"') { current += '"'; i++; }
+      else inQuotes = !inQuotes;
+    } else if (ch === ',' && !inQuotes) {
+      result.push(current);
+      current = '';
+    } else {
+      current += ch;
+    }
+  }
+  result.push(current);
+  return result;
+}
+
+function parseHevyDate(dateStr) {
+  if (!dateStr) return null;
+  const m = dateStr.match(/(\d{1,2})\s+(\w+)\s+(\d{4}),\s+(\d{2}):(\d{2})/);
+  if (!m) return null;
+  const MON = { Jan:0, Feb:1, Mar:2, Apr:3, May:4, Jun:5, Jul:6, Aug:7, Sep:8, Oct:9, Nov:10, Dec:11 };
+  const mo = MON[m[2]];
+  if (mo === undefined) return null;
+  return new Date(Date.UTC(parseInt(m[3]), mo, parseInt(m[1]), parseInt(m[4]) - 3, parseInt(m[5])));
+}
+
+function parseHevyCSV(csvText) {
+  const lines = csvText.split('\n').map(l => l.trim()).filter(Boolean);
+  if (lines.length < 2) return [];
+  const header = parseCSVLine(lines[0]).map(h => h.trim());
+  return lines.slice(1).map(line => {
+    const cols = parseCSVLine(line);
+    const row = {};
+    header.forEach((h, i) => { row[h] = (cols[i] ?? '').trim(); });
+    return row;
+  });
+}
+
+function groupHevyWorkouts(rows) {
+  const map = new Map();
+  for (const row of rows) {
+    const key = `${row.title}|${row.start_time}`;
+    if (!map.has(key)) {
+      const start = parseHevyDate(row.start_time);
+      map.set(key, {
+        title: row.title,
+        start_time: start?.toISOString() ?? null,
+        end_time: parseHevyDate(row.end_time)?.toISOString() ?? null,
+        workout_date: start?.toISOString().slice(0, 10) ?? null,
+        exMap: new Map(),
+      });
+    }
+    const w = map.get(key);
+    const ex = row.exercise_title;
+    if (!ex) continue;
+    if (!w.exMap.has(ex)) w.exMap.set(ex, []);
+    w.exMap.get(ex).push({
+      set: parseInt(row.set_index) + 1,
+      type: row.set_type || 'normal',
+      reps: row.reps ? parseInt(row.reps) : null,
+      weight_kg: row.weight_kg ? parseFloat(row.weight_kg) : null,
+      duration_s: row.duration_seconds ? parseInt(row.duration_seconds) : null,
+      distance_km: row.distance_km ? parseFloat(row.distance_km) : null,
+    });
+  }
+  return Array.from(map.values()).map(w => ({
+    title: w.title,
+    start_time: w.start_time,
+    end_time: w.end_time,
+    workout_date: w.workout_date,
+    exercises: Array.from(w.exMap.entries()).map(([name, sets]) => ({ name, sets })),
+  }));
+}
+
+function formatHevyExercise(ex) {
+  const sets = ex.sets ?? [];
+  if (!sets.length) return ex.name;
+  const allWeighted = sets.every(s => s.weight_kg);
+  if (allWeighted) {
+    return `${ex.name}: ${sets.length} sets · ${sets.map(s => `${s.reps}×${s.weight_kg}kg`).join(' / ')}`;
+  }
+  return `${ex.name}: ${sets.length} sets · ${sets.map(s => s.reps ?? '?').join('/')} reps`;
+}
+
+async function getHevyWorkoutsForRange(from) {
+  const { data } = await supabase.from('hevy_workouts').select('*').gte('workout_date', from.toISOString().slice(0, 10));
+  return data ?? [];
+}
+
 async function generateWeeklyReport() {
   const now = new Date();
   const weekStart   = new Date(now - 7  * 86400000);
@@ -666,13 +1303,20 @@ async function generateWeeklyReport() {
     return data ?? [];
   };
 
-  const [thisWeek, week1, week2, week3, week4] = await Promise.all([
+  const [thisWeek, week1, week2, week3, week4, hevyWorkouts] = await Promise.all([
     fetchActs(weekStart),
     fetchActs(w1Start, weekStart),
     fetchActs(w2Start, w1Start),
     fetchActs(w3Start, w2Start),
     fetchActs(w4Start, w3Start),
+    getHevyWorkoutsForRange(weekStart),
   ]);
+
+  const hevyByDate = {};
+  for (const h of hevyWorkouts) {
+    hevyByDate[h.workout_date] = hevyByDate[h.workout_date] ?? [];
+    hevyByDate[h.workout_date].push(h);
+  }
 
   const fmtTime = (s) => { const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60); return h > 0 ? `${h}h ${m}m` : `${m}m`; };
   const fmtPace = (s) => `${Math.floor(s / 60)}:${String(Math.round(s % 60)).padStart(2, '0')}`;
@@ -713,14 +1357,35 @@ async function generateWeeklyReport() {
   lines.push(`⏱ Total active time: ${fmtTime(totalSec)} | 🔥 ${totalCal} kcal`);
   lines.push('');
 
-  const typeEmoji = { Run: '🏃', Ride: '🚴', Swim: '🏊', Walk: '🚶', Hike: '🥾', WeightTraining: '🏋️', Tennis: '🎾', Yoga: '🧘', Workout: '💪' };
+  const typeLabel = { Run: '🏃 Runs', Ride: '🚴 Rides', Swim: '🏊 Swims', Walk: '🚶 Walks', Hike: '🥾 Hikes', WeightTraining: 'Strength Training 🏋️', Tennis: '🎾 Tennis', Yoga: '🧘 Yoga', Workout: '💪 Workout' };
+
   for (const [type, acts] of Object.entries(byType).sort()) {
-    const emoji  = typeEmoji[type] ?? '🏅';
+    const label  = typeLabel[type] ?? `🏅 ${type}`;
     const sec    = acts.reduce((s, a) => s + (a.moving_time_s ?? 0), 0);
     const cal    = acts.reduce((s, a) => s + (a.raw?.calories ?? 0), 0);
     const hrActs = acts.filter(a => a.raw?.has_heartrate && a.raw?.average_heartrate);
     const avgHR  = avgOfArr(hrActs.map(a => a.raw.average_heartrate));
-    lines.push(`${emoji} ${type}: ${acts.length}x | ${fmtTime(sec)}${cal > 0 ? ` | ${cal} kcal` : ''}${avgHR ? ` | avg HR ${avgHR} bpm` : ''}`);
+    lines.push(`${label}: ${acts.length}x | ${fmtTime(sec)}${cal > 0 ? ` | ${cal} kcal` : ''}${avgHR ? ` | avg HR ${avgHR} bpm` : ''}`);
+
+    // For strength sessions, show per-session exercise breakdown from hevy_workouts (or fall back to Strava description)
+    if (type === 'WeightTraining') {
+      for (const a of acts) {
+        const date = new Date(a.started_at).toLocaleDateString('en-GB', { weekday: 'short', day: 'numeric', month: 'short' });
+        const actDate = new Date(a.started_at).toISOString().slice(0, 10);
+        const sessionName = a.raw?.name ?? 'Strength session';
+        lines.push(`  ${date} · ${sessionName}`);
+        const hevyForDay = hevyByDate[actDate] ?? [];
+        const hevyMatch = hevyForDay.find(h => h.workout_title === sessionName) ?? hevyForDay[0];
+        if (hevyMatch?.exercises?.length) {
+          for (const ex of hevyMatch.exercises) lines.push(`  └ ${formatHevyExercise(ex)}`);
+        } else {
+          const desc = a.raw?.description ?? '';
+          if (desc.includes('Logged with Hevy')) {
+            for (const ex of parseHevyDescription(desc)) lines.push(`  └ ${ex}`);
+          }
+        }
+      }
+    }
   }
 
   // ── Best run ──
@@ -800,6 +1465,61 @@ async function generateWeeklyReport() {
   return lines.join('\n');
 }
 
+async function sendMorningPainCheck() {
+  await setBotState('conversation', { step: 'morning_pain_check' });
+  await sendTelegram(process.env.TELEGRAM_OWNER_CHAT_ID,
+    `Good morning Shahar 🌅\n\nHow is the soleus today?\n\nReply with a number 1 to 10\n(1 = no pain, 10 = severe pain)`
+  );
+}
+
+async function checkPainTrend() {
+  const sevenDaysAgo = new Date(Date.now() - 6 * 86400000).toISOString().slice(0, 10);
+  const { data } = await supabase.from('pain_log')
+    .select('date, pain_level')
+    .ilike('body_part', '%soleus%')
+    .eq('check_type', 'morning')
+    .gte('date', sevenDaysAgo)
+    .order('date', { ascending: true });
+  if (!data || data.length < 2) return;
+
+  // 5-day consecutive decrease
+  if (data.length >= 5) {
+    const last5 = data.slice(-5);
+    if (last5.every((r, i) => i === 0 || r.pain_level < last5[i - 1].pain_level)) {
+      await sendTelegram(process.env.TELEGRAM_OWNER_CHAT_ID,
+        '💪 Strong recovery trend — your body is responding to the program. Keep going.'
+      );
+      return;
+    }
+  }
+
+  // 2 consecutive days increasing
+  if (data.length >= 3) {
+    const last3 = data.slice(-3);
+    if (last3[2].pain_level > last3[1].pain_level && last3[1].pain_level > last3[0].pain_level) {
+      await sendTelegram(process.env.TELEGRAM_OWNER_CHAT_ID,
+        '⚠️ Pain trending up — back off all strengthening for 48 hours and message your physio.'
+      );
+    }
+  }
+}
+
+async function checkHighPainStreak() {
+  const threeDaysAgo = new Date(Date.now() - 2 * 86400000).toISOString().slice(0, 10);
+  const { data } = await supabase.from('pain_log')
+    .select('date, pain_level')
+    .ilike('body_part', '%soleus%')
+    .eq('check_type', 'morning')
+    .gte('date', threeDaysAgo)
+    .order('date', { ascending: true });
+  if (!data || data.length < 3) return;
+  if (data.slice(-3).every(r => r.pain_level > 7)) {
+    await sendTelegram(process.env.TELEGRAM_OWNER_CHAT_ID,
+      '🚨 Pain above 7/10 for 3 days in a row. Please contact your physio.'
+    );
+  }
+}
+
 // Weekly report every Saturday at 9:00pm Israel time
 cron.schedule('0 21 * * 6', async () => {
   console.log('[weekly] Sending weekly report');
@@ -818,15 +1538,48 @@ cron.schedule('0 6 * * *', async () => {
   await fetchAndStoreTodayPlan();
 }, { timezone: 'Asia/Jerusalem' });
 
+// Overtraining check every Monday at 8:00am Israel time
+cron.schedule('0 8 * * 1', async () => {
+  console.log('[overtraining] Running Monday check');
+  try {
+    const message = await checkOvertraining();
+    if (message) await sendTelegram(process.env.TELEGRAM_OWNER_CHAT_ID, message);
+    console.log('[overtraining] Done');
+  } catch (err) {
+    console.error('[overtraining] Error:', err.message);
+  }
+}, { timezone: 'Asia/Jerusalem' });
+
 // Daily briefing at 7:00am Israel time
 cron.schedule('0 7 * * *', async () => {
   console.log('[briefing] Sending morning briefing');
   try {
-    const message = await generateMorningBriefing();
-    await sendTelegram(process.env.TELEGRAM_OWNER_CHAT_ID, message);
+    const recovery = await getActiveRecoverySession();
+    if (recovery?.status === 'active') {
+      await sendMorningPainCheck();
+    } else {
+      const message = await generateMorningBriefing();
+      await sendTelegram(process.env.TELEGRAM_OWNER_CHAT_ID, message);
+    }
     console.log('[briefing] Sent successfully');
   } catch (err) {
     console.error('[briefing] Error:', err.message);
+  }
+}, { timezone: 'Asia/Jerusalem' });
+
+// Evening soleus check-in at 9:00pm every day during recovery
+cron.schedule('0 21 * * *', async () => {
+  try {
+    const recovery = await getActiveRecoverySession();
+    if (recovery?.status === 'active') {
+      await setBotState('conversation', { step: 'evening_pain_check' });
+      await sendTelegram(process.env.TELEGRAM_OWNER_CHAT_ID,
+        `🌙 Evening check-in\n\nHow does the soleus feel after today?\nReply with a number 1 to 10`
+      );
+      console.log('[evening_check] Sent');
+    }
+  } catch (err) {
+    console.error('[evening_check] Error:', err.message);
   }
 }, { timezone: 'Asia/Jerusalem' });
 
