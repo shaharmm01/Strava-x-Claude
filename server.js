@@ -7,6 +7,7 @@ const Anthropic = require('@anthropic-ai/sdk');
 const cron = require('node-cron');
 const axios = require('axios');
 const cheerio = require('cheerio');
+const puppeteer = require('puppeteer');
 
 const app = express();
 app.use(express.json());
@@ -257,6 +258,51 @@ app.get('/overtraining/:secret', async (req, res) => {
   }
 });
 
+// MFP diagnostic: GET /mfp_check/:secret?date=YYYY-MM-DD
+// Renders the diary page with Puppeteer and reports what was found
+app.get('/mfp_check/:secret', async (req, res) => {
+  if (req.params.secret !== process.env.COMPOSIO_WEBHOOK_SECRET) return res.status(401).send('Unauthorized');
+
+  const date = req.query.date ?? new Date(Date.now() - 86400000).toISOString().slice(0, 10);
+  const username = process.env.MFP_USERNAME;
+  const url = `https://www.myfitnesspal.com/reports/printable-diary/${username}?from=${date}&to=${date}`;
+  const report = { url, date, error: null };
+
+  const browser = await puppeteer.launch({
+    args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu'],
+    headless: true,
+  });
+
+  try {
+    const page = await browser.newPage();
+    await page.setUserAgent('Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
+
+    await page.goto(url, { waitUntil: 'networkidle2', timeout: 30000 });
+    await page.waitForSelector('table', { timeout: 15000 }).catch(() => {});
+    const html = await page.content();
+    const $ = cheerio.load(html);
+
+    report.tableCount = $('table').length;
+    report.theadTh = $('thead tr th').map((_, el) => $(el).text().trim()).get();
+    const totalsRow = $('tr').filter((_, el) => /^totals$/i.test($(el).find('th, td').first().text().trim())).first();
+    report.totalsRowFound = totalsRow.length > 0;
+    const cols = totalsRow.find('th, td').map((_, el) => $(el).text().trim().replace(/,/g, '')).get();
+    const headers = $('thead tr th').map((_, el) => $(el).text().trim().toLowerCase()).get();
+    const getValue = (name) => { const idx = headers.findIndex(h => h.includes(name)); return idx >= 0 && cols[idx] ? parseInt(cols[idx]) || null : null; };
+    report.parsed = {
+      calories: getValue('calorie') ?? getValue('cal') ?? (cols[1] ? parseInt(cols[1]) : null),
+      protein_g: getValue('protein'), carbs_g: getValue('carb'), fat_g: getValue('fat'),
+      sodium_mg: getValue('sodium'), sugar_g: getValue('sugar'), fiber_g: getValue('fiber'),
+    };
+  } catch (err) {
+    report.error = err.message;
+  } finally {
+    await browser.close();
+  }
+
+  res.json(report);
+});
+
 // Hevy CSV import: POST /import/hevy/:secret
 // Body: raw CSV text — curl -X POST "URL/import/hevy/SECRET" -H "Content-Type: text/plain" --data-binary @workout_data.csv
 app.post('/import/hevy/:secret', express.text({ type: '*/*', limit: '10mb' }), async (req, res) => {
@@ -309,6 +355,24 @@ app.post('/webhook/telegram', (req, res) => {
     handleInjuries(chatId).catch(err => console.error('[injuries] Error:', err.message));
   } else if (/^\/return$/i.test(text)) {
     handleReturnCommand(chatId).catch(err => console.error('[return] Error:', err.message));
+  } else if (/^\/eats_yesterday$/i.test(text)) {
+    const d = new Date(Date.now() - 86400000);
+    const label = d.toLocaleDateString('en-GB', { weekday: 'long', day: 'numeric', month: 'short' });
+    handleEats(chatId, d.toISOString().slice(0, 10), label).catch(err => console.error('[eats] Error:', err.message));
+  } else if (/^\/eats$/i.test(text)) {
+    const d = new Date();
+    const label = d.toLocaleDateString('en-GB', { weekday: 'long', day: 'numeric', month: 'short' });
+    handleEats(chatId, d.toISOString().slice(0, 10), label).catch(err => console.error('[eats] Error:', err.message));
+  } else if (/^\/nutrition_week$/i.test(text)) {
+    handleNutritionWeek(chatId).catch(err => console.error('[nutrition] Error:', err.message));
+  } else if (/^\/nutrition_yesterday$/i.test(text)) {
+    const d = new Date(Date.now() - 86400000);
+    const label = d.toLocaleDateString('en-GB', { weekday: 'long', day: 'numeric', month: 'short' });
+    handleNutrition(chatId, d.toISOString().slice(0, 10), label).catch(err => console.error('[nutrition] Error:', err.message));
+  } else if (/^\/nutrition$/i.test(text)) {
+    const d = new Date();
+    const label = d.toLocaleDateString('en-GB', { weekday: 'long', day: 'numeric', month: 'short' });
+    handleNutrition(chatId, d.toISOString().slice(0, 10), label).catch(err => console.error('[nutrition] Error:', err.message));
   } else {
     getBotState('conversation').then(state => {
       if (state?.step) {
@@ -499,39 +563,80 @@ async function getCoachingResponse(userText) {
 }
 
 async function fetchMFPDiary(dateStr) {
-  const url = `https://www.myfitnesspal.com/food/diary/zivshahar01?date=${dateStr}`;
-  const { data: html } = await axios.get(url, {
-    headers: {
-      'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-      'Accept-Language': 'en-US,en;q=0.9',
-    },
-    timeout: 10000,
+  const username = process.env.MFP_USERNAME;
+  const url = `https://www.myfitnesspal.com/reports/printable-diary/${username}?from=${dateStr}&to=${dateStr}`;
+
+  const browser = await puppeteer.launch({
+    args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu'],
+    headless: true,
   });
 
-  const $ = cheerio.load(html);
+  let result;
+  try {
+    const page = await browser.newPage();
+    await page.setUserAgent('Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
+    console.log(`[mfp] Navigating to ${url}`);
+    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
+    console.log('[mfp] DOM loaded, waiting for table rows');
+    await page.waitForSelector('.MuiTableRow-root', { timeout: 25000 });
+    console.log('[mfp] Table rows visible, extracting data');
 
-  // MFP totals row is in the bottom of the diary table
-  const totalsRow = $('tr.total').last();
-  const cols = totalsRow.find('td').map((_, el) => $(el).text().trim().replace(/,/g, '')).get();
+    result = await page.evaluate(() => {
+      const tables = document.querySelectorAll('table');
+      if (!tables.length) return null;
 
-  // Column order: Calories, Carbs, Fat, Protein, Sodium, Sugar (may vary)
-  // Find the header row to map columns correctly
-  const headers = $('thead tr th').map((_, el) => $(el).text().trim().toLowerCase()).get();
+      const getCells = (row) => Array.from(row.querySelectorAll('th, td')).map(c => c.textContent.trim());
+      const toInt = (s) => { const n = parseInt(s); return isNaN(n) ? null : n; };
 
-  const getValue = (name) => {
-    const idx = headers.findIndex(h => h.includes(name));
-    return idx >= 0 && cols[idx] ? parseInt(cols[idx]) || null : null;
-  };
+      // Totals row: first cell is "TOTALS" (case-insensitive), first table only
+      let totals = null;
+      let headers = [];
+      for (const row of tables[0].querySelectorAll('tr')) {
+        const cells = getCells(row);
+        if (!cells.length) continue;
+        if (row.classList.contains('MuiTableRow-head')) {
+          headers = cells.map(h => h.toLowerCase());
+          continue;
+        }
+        if (/^totals$/i.test(cells[0])) { totals = cells; break; }
+      }
 
-  const calories = getValue('calories') ?? (cols[1] ? parseInt(cols[1]) : null);
-  const carbs    = getValue('carb');
-  const fat      = getValue('fat');
-  const protein  = getValue('protein');
-  const fiber    = getValue('fiber');
-  const sugar    = getValue('sugar');
+      const idx = (name) => headers.findIndex(h => h.includes(name));
+      const get = (name) => totals ? toInt(totals[idx(name)]) : null;
 
-  return { calories, protein_g: protein, carbs_g: carbs, fat_g: fat, fiber_g: fiber, sugar_g: sugar, raw: { url, date: dateStr } };
+      // Food items grouped by meal
+      const meals = {};
+      let currentMeal = 'Other';
+      for (const row of tables[0].querySelectorAll('tr')) {
+        if (row.classList.contains('MuiTableRow-head')) continue;
+        const cells = getCells(row);
+        if (!cells.length || !cells[0]) continue;
+        if (/^totals$/i.test(cells[0])) continue;
+        const cal = toInt(cells[1]);
+        if (cal !== null && cal > 0) {
+          if (!meals[currentMeal]) meals[currentMeal] = [];
+          meals[currentMeal].push({ name: cells[0], calories: cal, carbs_g: toInt(cells[2]), fat_g: toInt(cells[3]), protein_g: toInt(cells[4]), sodium_mg: toInt(cells[6]), sugar_g: toInt(cells[7]), fiber_g: toInt(cells[8]) });
+        } else if (cells.slice(1).every(c => !c || c === '--' || c === '-' || /^0(mg|g)?$/.test(c))) {
+          currentMeal = cells[0];
+        }
+      }
+
+      return {
+        calories: get('calorie') ?? get('cal'),
+        carbs_g: get('carb'), fat_g: get('fat'), protein_g: get('protein'),
+        fiber_g: get('fiber'), sugar_g: get('sugar'), sodium_mg: get('sodium'),
+        meals,
+      };
+    });
+
+    console.log(`[mfp] Extracted: cal=${result?.calories} meals=${Object.keys(result?.meals ?? {}).join(',')}`);
+  } finally {
+    await browser.close();
+  }
+
+  if (!result) return { calories: null, protein_g: null, carbs_g: null, fat_g: null, fiber_g: null, sugar_g: null, sodium_mg: null, raw: { url, date: dateStr, meals: {} } };
+  const { meals, ...totals } = result;
+  return { ...totals, raw: { url, date: dateStr, meals } };
 }
 
 async function storeDailyNutrition(dateStr) {
@@ -545,6 +650,115 @@ async function storeDailyNutrition(dateStr) {
     console.error('[mfp] Fetch error:', err.message);
     return null;
   }
+}
+
+async function runMFPScrapeWithRetry(dateStr) {
+  const result = await storeDailyNutrition(dateStr);
+  if (!result) {
+    await sendTelegram(process.env.TELEGRAM_OWNER_CHAT_ID, 'MFP scrape failed — check diary is public.');
+    console.log('[mfp] Retry scheduled in 30 minutes');
+    setTimeout(async () => {
+      console.log('[mfp] Retrying scrape for', dateStr);
+      await storeDailyNutrition(dateStr);
+    }, 30 * 60 * 1000);
+  }
+}
+
+async function handleNutrition(chatId, dateStr, label) {
+  let nutrition = await getStoredNutrition(dateStr);
+  if (!nutrition) nutrition = await storeDailyNutrition(dateStr);
+  if (!nutrition?.calories) {
+    await sendTelegram(chatId, `No nutrition data for ${label}. Make sure your MFP diary is public.`);
+    return;
+  }
+  const lines = [
+    `Nutrition — ${label}`,
+    `Calories: ${nutrition.calories} kcal`,
+    `Protein: ${nutrition.protein_g ?? '—'}g`,
+    `Carbs: ${nutrition.carbs_g ?? '—'}g`,
+    `Fat: ${nutrition.fat_g ?? '—'}g`,
+    `Sodium: ${nutrition.sodium_mg ?? '—'}mg`,
+    `Sugar: ${nutrition.sugar_g ?? '—'}g`,
+    `Fiber: ${nutrition.fiber_g ?? '—'}g`,
+  ];
+  await sendTelegram(chatId, lines.join('\n'));
+}
+
+async function handleEats(chatId, dateStr, label) {
+  let nutrition = await getStoredNutrition(dateStr);
+  // Re-scrape if meals missing or predate sodium/sugar/fiber support
+  const firstItem = Object.values(nutrition?.raw?.meals ?? {})[0]?.[0];
+  if (!nutrition?.raw?.meals || !('sodium_mg' in (firstItem ?? {}))) {
+    nutrition = await storeDailyNutrition(dateStr);
+  }
+  const meals = nutrition?.raw?.meals;
+  if (!meals || !Object.keys(meals).length) {
+    await sendTelegram(chatId, `No food log for ${label}.`);
+    return;
+  }
+
+  // Sort meals in standard order
+  const MEAL_ORDER = ['breakfast', 'morning snack', 'lunch', 'afternoon snack', 'dinner', 'evening snack', 'snacks'];
+  const sortedMeals = Object.entries(meals).sort(([a], [b]) => {
+    const ai = MEAL_ORDER.findIndex(m => a.toLowerCase().includes(m));
+    const bi = MEAL_ORDER.findIndex(m => b.toLowerCase().includes(m));
+    return (ai === -1 ? 99 : ai) - (bi === -1 ? 99 : bi);
+  });
+
+  // Translate all food names to English in one Claude call
+  const allNames = sortedMeals.flatMap(([, items]) => items.map(i => i.name));
+  let translatedNames = allNames;
+  try {
+    const res = await anthropic.messages.create({
+      model: 'claude-haiku-4-5-20251001',
+      max_tokens: 600,
+      messages: [{ role: 'user', content: `Translate these food names to English. Keep brand names, quantities and units as-is. Return only a JSON array of strings in the same order, nothing else.\n${JSON.stringify(allNames)}` }],
+    });
+    const parsed = JSON.parse(res.content[0].text.replace(/```json|```/g, '').trim());
+    if (Array.isArray(parsed) && parsed.length === allNames.length) translatedNames = parsed;
+  } catch {}
+
+  const lines = [`Food log — ${label}`];
+  let nameIdx = 0;
+  for (const [meal, items] of sortedMeals) {
+    lines.push(`\n${meal}:`);
+    for (const item of items) {
+      const name = translatedNames[nameIdx++];
+      const parts = [`${item.calories} kcal`, `p ${item.protein_g ?? 0}g`, `c ${item.carbs_g ?? 0}g`, `f ${item.fat_g ?? 0}g`];
+      if (item.sodium_mg != null) parts.push(`na ${item.sodium_mg}mg`);
+      if (item.sugar_g   != null) parts.push(`su ${item.sugar_g}g`);
+      if (item.fiber_g   != null) parts.push(`fi ${item.fiber_g}g`);
+      lines.push(`• ${name} — ${parts.join(' - ')}`);
+    }
+  }
+  if (nutrition.calories) lines.push(`\nTotal: ${nutrition.calories} kcal - p ${nutrition.protein_g ?? 0}g - c ${nutrition.carbs_g ?? 0}g - f ${nutrition.fat_g ?? 0}g`);
+  await sendTelegram(chatId, lines.join('\n'));
+}
+
+async function handleNutritionWeek(chatId) {
+  const now = new Date();
+  const rows = [];
+  for (let i = 1; i <= 7; i++) {
+    const d = new Date(now - i * 86400000).toISOString().slice(0, 10);
+    const row = await getStoredNutrition(d);
+    if (row?.calories) rows.push(row);
+  }
+  if (!rows.length) {
+    await sendTelegram(chatId, 'No nutrition data for the past 7 days.');
+    return;
+  }
+  const avg = (key) => Math.round(rows.reduce((s, r) => s + (r[key] ?? 0), 0) / rows.length);
+  const lines = [
+    `Nutrition — 7-day average (${rows.length} days logged)`,
+    `Calories: ${avg('calories')} kcal/day`,
+    `Protein: ${avg('protein_g')}g/day`,
+    `Carbs: ${avg('carbs_g')}g/day`,
+    `Fat: ${avg('fat_g')}g/day`,
+    `Sodium: ${avg('sodium_mg')}mg/day`,
+    `Sugar: ${avg('sugar_g')}g/day`,
+    `Fiber: ${avg('fiber_g')}g/day`,
+  ];
+  await sendTelegram(chatId, lines.join('\n'));
 }
 
 async function getStoredNutrition(dateStr) {
@@ -1081,7 +1295,11 @@ Keep it under 150 words. Start with today's date.`;
   const nutrition = await storeDailyNutrition(yesterday);
   let nutritionLine = '';
   if (nutrition?.calories) {
-    nutritionLine = `\n\n🍽 Yesterday's nutrition: ${nutrition.calories} kcal · P ${nutrition.protein_g}g · C ${nutrition.carbs_g}g · F ${nutrition.fat_g}g`;
+    const parts = [`${nutrition.calories} kcal`, `${nutrition.protein_g ?? 0}g protein`, `${nutrition.carbs_g ?? 0}g carbs`, `${nutrition.fat_g ?? 0}g fat`];
+    if (nutrition.sodium_mg) parts.push(`${nutrition.sodium_mg}mg sodium`);
+    if (nutrition.sugar_g) parts.push(`${nutrition.sugar_g}g sugar`);
+    if (nutrition.fiber_g) parts.push(`${nutrition.fiber_g}g fiber`);
+    nutritionLine = `\n\nYesterday: ${parts.join(' · ')}`;
   }
 
   let planLine = '';
@@ -1451,12 +1669,9 @@ async function generateWeeklyReport() {
     if (row?.calories) nutritionRows.push(row);
   }
   if (nutritionRows.length) {
-    const avgCal  = Math.round(nutritionRows.reduce((s, r) => s + r.calories, 0) / nutritionRows.length);
-    const avgProt = Math.round(nutritionRows.reduce((s, r) => s + (r.protein_g ?? 0), 0) / nutritionRows.length);
-    const avgCarb = Math.round(nutritionRows.reduce((s, r) => s + (r.carbs_g ?? 0), 0) / nutritionRows.length);
-    const avgFat  = Math.round(nutritionRows.reduce((s, r) => s + (r.fat_g ?? 0), 0) / nutritionRows.length);
+    const avg = (key) => Math.round(nutritionRows.reduce((s, r) => s + (r[key] ?? 0), 0) / nutritionRows.length);
     lines.push('');
-    lines.push(`🍽 Nutrition (${nutritionRows.length}-day avg): ${avgCal} kcal · P ${avgProt}g · C ${avgCarb}g · F ${avgFat}g`);
+    lines.push(`🍽 Nutrition (${nutritionRows.length}-day avg): ${avg('calories')} kcal · ${avg('protein_g')}g protein · ${avg('carbs_g')}g carbs · ${avg('fat_g')}g fat · ${avg('sodium_mg')}mg sodium · ${avg('sugar_g')}g sugar · ${avg('fiber_g')}g fiber`);
   }
 
   lines.push('');
@@ -1520,6 +1735,13 @@ async function checkHighPainStreak() {
   }
 }
 
+// MFP nightly scrape at 11:30pm Israel time — captures full day before bed
+cron.schedule('30 23 * * *', async () => {
+  const today = new Date().toISOString().slice(0, 10);
+  console.log('[mfp] Nightly scrape for', today);
+  await runMFPScrapeWithRetry(today);
+}, { timezone: 'Asia/Jerusalem' });
+
 // Weekly report every Saturday at 9:00pm Israel time
 cron.schedule('0 21 * * 6', async () => {
   console.log('[weekly] Sending weekly report');
@@ -1557,10 +1779,9 @@ cron.schedule('0 7 * * *', async () => {
     const recovery = await getActiveRecoverySession();
     if (recovery?.status === 'active') {
       await sendMorningPainCheck();
-    } else {
-      const message = await generateMorningBriefing();
-      await sendTelegram(process.env.TELEGRAM_OWNER_CHAT_ID, message);
-    }
+    } 
+    const message = await generateMorningBriefing();
+    await sendTelegram(process.env.TELEGRAM_OWNER_CHAT_ID, message);
     console.log('[briefing] Sent successfully');
   } catch (err) {
     console.error('[briefing] Error:', err.message);
