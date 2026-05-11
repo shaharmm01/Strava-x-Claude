@@ -26,11 +26,18 @@ app.get('/briefing/:secret', async (req, res) => {
   if (req.params.secret !== process.env.COMPOSIO_WEBHOOK_SECRET) return res.status(401).send('Unauthorized');
   res.status(200).send('Briefing triggered');
   try {
-    const message = await generateMorningBriefing();
-    await sendTelegram(process.env.TELEGRAM_OWNER_CHAT_ID, message);
     const recovery = await getActiveRecoverySession();
     if (recovery?.status === 'active') await sendMorningPainCheck();
-    console.log('[briefing] Manual trigger sent');
+    const today = new Date().toLocaleDateString('en-GB', { day: 'numeric', month: 'long', timeZone: 'Asia/Jerusalem' });
+    try {
+      const imageBuffer = await generateBriefingImage();
+      await sendTelegramPhoto(process.env.TELEGRAM_OWNER_CHAT_ID, imageBuffer, `🌅 Your briefing for ${today} · tap for details`);
+      console.log('[briefing] Manual image sent');
+    } catch (imgErr) {
+      console.error('[briefing] Image failed, falling back to text:', imgErr.message, imgErr.stack);
+      const message = await generateMorningBriefing();
+      await sendTelegram(process.env.TELEGRAM_OWNER_CHAT_ID, message);
+    }
   } catch (err) {
     console.error('[briefing] Manual trigger error:', err.message);
   }
@@ -1243,6 +1250,409 @@ async function getRehabProgram(session) {
   return lines.join('\n');
 }
 
+// ── Image Briefing ────────────────────────────────────────────────────────────
+
+async function getStructuredWeather() {
+  const lat = process.env.RUNNER_LAT;
+  const lon = process.env.RUNNER_LON;
+  const key = process.env.OPENWEATHER_API_KEY;
+  const r = await fetch(`https://api.openweathermap.org/data/2.5/forecast?lat=${lat}&lon=${lon}&appid=${key}&units=metric`);
+  if (!r.ok) return null;
+  const data = await r.json();
+
+  const now = Date.now() / 1000;
+  const israelOffset = 3 * 3600;
+  const toLocalTime = (dt) => {
+    const h = Math.floor(((dt + israelOffset) % 86400) / 3600);
+    const m = Math.floor(((dt + israelOffset) % 3600) / 60);
+    return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}`;
+  };
+
+  const slots = data.list.filter(s => s.dt > now && s.dt < now + 48 * 3600);
+  if (!slots.length) return null;
+
+  const current = slots[0];
+
+  const todaySlots = slots.filter(s => s.dt < now + 14 * 3600);
+  const peakSlot = todaySlots.reduce((max, s) => s.main.temp > max.main.temp ? s : max, todaySlots[0] ?? current);
+
+  const candidateSlots = slots.filter(s => {
+    const h = ((s.dt + israelOffset) % 86400) / 3600;
+    return (h >= 5 && h <= 9) || (h >= 16 && h <= 19);
+  });
+  const bestSlot = candidateSlots.length
+    ? candidateSlots.reduce((best, s) => s.main.temp < best.main.temp ? s : best, candidateSlots[0])
+    : slots.reduce((best, s) => s.main.temp < best.main.temp ? s : best, slots[0]);
+
+  const tomorrowSlots = slots.filter(s => s.dt > now + 12 * 3600 && s.dt < now + 36 * 3600);
+  const tomorrowPeak = tomorrowSlots.length ? Math.round(Math.max(...tomorrowSlots.map(s => s.main.temp))) : null;
+
+  return {
+    current: {
+      temp: Math.round(current.main.temp),
+      description: current.weather[0].description,
+      windSpeed: Math.round(current.wind.speed),
+      humidity: current.main.humidity,
+    },
+    peak: { temp: Math.round(peakSlot.main.temp), time: toLocalTime(peakSlot.dt) },
+    bestWindow: {
+      start: toLocalTime(bestSlot.dt),
+      end: toLocalTime(bestSlot.dt + 5400),
+      temp: Math.round(bestSlot.main.temp),
+    },
+    tomorrow: {
+      peak: tomorrowPeak,
+      description: tomorrowSlots[0]?.weather[0]?.main ?? null,
+      isHot: tomorrowPeak != null && tomorrowPeak > 30,
+    },
+  };
+}
+
+async function getRehabDataStructured(session, painLevel) {
+  if (!session || !/soleus/i.test(session.body_part)) return null;
+  const today = new Date().toISOString().slice(0, 10);
+  const { data: todayPain } = await supabase.from('pain_log')
+    .select('pain_level')
+    .ilike('body_part', '%soleus%')
+    .eq('date', today)
+    .order('pain_level', { ascending: false })
+    .limit(1);
+  const maxPain = todayPain?.[0]?.pain_level ?? painLevel ?? 0;
+  const daysElapsed = Math.floor((Date.now() - new Date(session.started_at).getTime()) / 86400000);
+  const dayNumber = daysElapsed + 1;
+  const stretchOnly = maxPain > 7 || dayNumber % 2 === 0;
+
+  const parseExercise = (ex) => {
+    const m = ex.match(/^(.+?)\s+—\s+(.+?)(?:\s+\(|$)/);
+    return m ? { name: m[1].trim(), reps: m[2].trim() } : { name: ex, reps: '' };
+  };
+
+  return {
+    dayNumber,
+    stretchOnly,
+    label: maxPain > 7 ? 'High pain — stretch only' : stretchOnly ? 'Recovery day — stretch only' : 'Full program',
+    strengthening: stretchOnly ? [] : SOLEUS_STRENGTHENING.map(parseExercise),
+    stretching: SOLEUS_STRETCHING.map(parseExercise),
+  };
+}
+
+function calculateReadinessScore(painLevel, recoverySession) {
+  if (!recoverySession) return { score: 75, description: 'No active injury — full training load OK', level: 'good' };
+  const pain = painLevel ?? 5;
+  if (pain <= 2) return { score: 70, description: 'Low pain — light activity OK', level: 'moderate' };
+  if (pain <= 4) return { score: 60, description: 'Moderate pain — rehab + cross-train', level: 'caution' };
+  if (pain <= 6) return { score: 52, description: 'Significant pain — rest day recommended', level: 'low' };
+  return { score: 42, description: 'High pain — full rest, ice & elevate', level: 'critical' };
+}
+
+async function getBriefingData() {
+  const yesterday = new Date(Date.now() - 86400000).toISOString().slice(0, 10);
+  const [weatherData, recoverySession, nutrition, plan] = await Promise.all([
+    getStructuredWeather().catch(() => null),
+    getActiveRecoverySession(),
+    getStoredNutrition(yesterday),
+    getTodayPlan().catch(() => null),
+  ]);
+
+  let painTrend = null, latestPainLevel = null, rehab = null, crossTraining = null, dayNumber = null;
+
+  if (recoverySession) {
+    const { data: painRows } = await supabase.from('pain_log')
+      .select('pain_level')
+      .ilike('body_part', `%${recoverySession.body_part}%`)
+      .order('date', { ascending: false })
+      .limit(1);
+    latestPainLevel = painRows?.[0]?.pain_level ?? null;
+    [painTrend, rehab] = await Promise.all([
+      getPainTrend(recoverySession.body_part),
+      getRehabDataStructured(recoverySession, latestPainLevel ?? 3),
+    ]);
+    dayNumber = Math.floor((Date.now() - new Date(recoverySession.started_at).getTime()) / 86400000) + 1;
+    crossTraining = getAlternativeActivities(recoverySession.body_part);
+  }
+
+  const readiness = calculateReadinessScore(latestPainLevel, recoverySession);
+  const hasRun = !!(plan?.distance_km || plan?.workout_type?.toLowerCase().includes('run'));
+  const hydration = hasRun ? 3.5 : 2.5;
+  const dateStr = new Date().toLocaleDateString('en-GB', {
+    weekday: 'long', day: 'numeric', month: 'long', year: 'numeric', timeZone: 'Asia/Jerusalem',
+  });
+  return { dateStr, weather: weatherData, recovery: recoverySession, painTrend, latestPainLevel, rehab, crossTraining, dayNumber, nutrition, readiness, hydration, plan };
+}
+
+function buildBriefingHTML(d) {
+  const { dateStr, weather, recovery, painTrend, latestPainLevel, rehab, crossTraining, dayNumber, nutrition, readiness, hydration } = d;
+
+  const rcColor = { good: '#5BB4FF', moderate: '#7BD8FF', caution: '#FFB450', low: '#FF9A6B', critical: '#FF6B6B' }[readiness.level] ?? '#5BB4FF';
+  const rcBg   = { good: 'rgba(91,180,255,0.15)', moderate: 'rgba(123,216,255,0.15)', caution: 'rgba(255,180,80,0.15)', low: 'rgba(255,154,107,0.15)', critical: 'rgba(255,107,107,0.15)' }[readiness.level] ?? 'rgba(91,180,255,0.15)';
+  const trendIcon  = { improving: '↓ Improving', worsening: '↑ Worsening', stable: '→ Stable' }[painTrend] ?? '— Unknown';
+  const trendColor = { improving: '#A0F0B0', worsening: '#FF6B6B', stable: '#FFB450' }[painTrend] ?? 'rgba(255,255,255,0.55)';
+
+  const crossPills = crossTraining
+    ? crossTraining.split(',').map(s => s.replace(/\s*\([^)]*\)/, '').trim()).filter(Boolean)
+    : ['Swimming', 'Cycling', 'Strength'];
+
+  const kcal    = nutrition?.calories ?? 0;
+  const protein = nutrition?.protein_g ?? 0;
+  const carbs   = nutrition?.carbs_g ?? 0;
+  const fat     = nutrition?.fat_g ?? 0;
+  const totalMacroKcal = protein * 4 + carbs * 4 + fat * 9;
+  const proteinPct = totalMacroKcal > 0 ? Math.round((protein * 4 / totalMacroKcal) * 100) : 33;
+  const carbsPct   = totalMacroKcal > 0 ? Math.round((carbs * 4 / totalMacroKcal) * 100) : 34;
+  const fatPct     = 100 - proteinPct - carbsPct;
+
+  const chipText = dayNumber ? `Day ${dayNumber}/14` : 'Training';
+  const israelHour = parseInt(new Date().toLocaleString('en-US', { hour: 'numeric', hour12: false, timeZone: 'Asia/Jerusalem' }));
+  const greeting = israelHour < 12 ? 'Good morning' : 'Good afternoon';
+
+  const exRows = (exList) => exList.map(ex =>
+    `<div class="ex-row"><div class="ex-name">${ex.name}</div><div class="ex-reps">${ex.reps}</div></div>`
+  ).join('');
+  const pills = (list, cls = '') => list.map(p => `<span class="pill ${cls}">${p}</span>`).join('');
+  const mfpStatus = nutrition?.calories ? 'dot-green' : 'dot-amber';
+
+  return `<!DOCTYPE html>
+<html><head><meta charset="UTF-8">
+<style>
+* { margin:0; padding:0; box-sizing:border-box; }
+body { width:520px; background:linear-gradient(135deg,#061B33 0%,#0A2C52 50%,#0F3A6B 100%); font-family:-apple-system,'Helvetica Neue',Arial,sans-serif; color:#fff; }
+.outer { position:relative; width:520px; padding:18px; overflow:hidden; }
+.blob-tr { position:absolute; top:-80px; right:-80px; width:300px; height:300px; border-radius:50%; background:radial-gradient(circle,rgba(80,180,255,0.4) 0%,transparent 70%); z-index:0; pointer-events:none; }
+.blob-bl { position:absolute; bottom:220px; left:-80px; width:260px; height:260px; border-radius:50%; background:radial-gradient(circle,rgba(120,220,255,0.3) 0%,transparent 70%); z-index:0; pointer-events:none; }
+.content { position:relative; z-index:1; }
+.card { background:rgba(255,255,255,0.07); border:1px solid rgba(255,255,255,0.12); border-radius:14px; padding:14px 16px; margin-bottom:10px; }
+.card-warn { background:rgba(255,180,80,0.08); border-color:rgba(255,180,80,0.4); }
+.lbl { font-size:10px; font-weight:600; text-transform:uppercase; letter-spacing:1px; color:rgba(255,255,255,0.4); margin-bottom:8px; }
+.header { display:flex; justify-content:space-between; align-items:flex-start; margin-bottom:14px; padding:2px; }
+.greeting { font-size:22px; font-weight:700; }
+.date-sub { font-size:12px; color:rgba(255,255,255,0.52); margin-top:3px; }
+.chip { font-size:11px; font-weight:600; padding:5px 12px; border-radius:20px; background:rgba(91,180,255,0.18); color:#5BB4FF; border:1px solid rgba(91,180,255,0.35); white-space:nowrap; margin-top:2px; }
+.rc-row { display:flex; align-items:center; gap:14px; }
+.rc-circle { flex-shrink:0; width:70px; height:70px; border-radius:50%; border:3px solid ${rcColor}; background:${rcBg}; display:flex; flex-direction:column; align-items:center; justify-content:center; }
+.rc-num { font-size:27px; font-weight:800; color:${rcColor}; line-height:1; }
+.rc-unit { font-size:9px; color:rgba(255,255,255,0.38); text-transform:uppercase; letter-spacing:0.5px; }
+.rc-desc { font-size:13px; color:rgba(255,255,255,0.78); line-height:1.45; }
+.rec-top { display:flex; justify-content:space-between; align-items:flex-start; margin-bottom:6px; }
+.rec-title { font-size:14px; font-weight:700; color:#FFB450; }
+.pain-big { font-size:34px; font-weight:800; color:#FFB450; line-height:1; }
+.pain-sub { font-size:10px; color:rgba(255,255,255,0.38); text-transform:uppercase; }
+.trend { font-size:12px; font-weight:500; color:${trendColor}; margin-top:4px; }
+.wx-opt { font-size:14px; font-weight:600; color:#fff; margin-bottom:12px; }
+.wx-win { font-size:12px; color:#5BB4FF; font-weight:500; }
+.wx-grid { display:flex; gap:8px; }
+.wx-stat { flex:1; background:rgba(255,255,255,0.05); border-radius:10px; padding:10px; text-align:center; }
+.wx-val { font-size:22px; font-weight:700; color:#5BB4FF; }
+.wx-lbl { font-size:10px; color:rgba(255,255,255,0.4); text-transform:uppercase; letter-spacing:0.6px; margin-top:3px; }
+.ex-sec { font-size:11px; font-weight:600; color:rgba(255,255,255,0.38); text-transform:uppercase; letter-spacing:0.8px; margin:8px 0 4px; }
+.ex-row { display:flex; justify-content:space-between; align-items:center; padding:7px 0; border-bottom:1px solid rgba(255,255,255,0.06); }
+.ex-row:last-child { border-bottom:none; }
+.ex-name { font-size:12.5px; color:rgba(255,255,255,0.82); flex:1; padding-right:8px; line-height:1.3; }
+.ex-reps { font-size:11.5px; color:#5BB4FF; font-weight:600; white-space:nowrap; }
+.pills { display:flex; flex-wrap:wrap; gap:6px; margin-top:8px; }
+.pill { font-size:11px; padding:4px 10px; border-radius:12px; background:rgba(255,255,255,0.08); color:rgba(255,255,255,0.72); border:1px solid rgba(255,255,255,0.13); }
+.pill-amber { background:rgba(255,180,80,0.15); color:#FFB450; border-color:rgba(255,180,80,0.3); }
+.pill-green { background:rgba(160,240,176,0.12); color:#A0F0B0; border-color:rgba(160,240,176,0.25); }
+.nutr-top { display:flex; justify-content:space-between; align-items:flex-start; margin-bottom:10px; }
+.kcal-big { font-size:32px; font-weight:800; color:#fff; line-height:1; }
+.kcal-sub { font-size:10px; color:rgba(255,255,255,0.4); margin-top:2px; }
+.nutr-right { text-align:right; }
+.nutr-line { font-size:12px; color:rgba(255,255,255,0.6); margin-bottom:3px; }
+.nutr-val { color:#7BD8FF; font-weight:600; }
+.macro-bar { height:8px; border-radius:4px; overflow:hidden; display:flex; margin-bottom:6px; }
+.mp { background:#5BB4FF; width:${proteinPct}%; }
+.mc { background:#7BD8FF; width:${carbsPct}%; }
+.mf { background:#9EEAFF; width:${fatPct}%; }
+.macro-lbls { display:flex; gap:10px; }
+.mlbl { font-size:10px; color:rgba(255,255,255,0.48); }
+.mlbl b { color:rgba(255,255,255,0.75); }
+.sleep-row { display:flex; align-items:center; gap:10px; }
+.sleep-icon { font-size:26px; }
+.sleep-txt { font-size:13px; color:rgba(255,255,255,0.52); }
+.sleep-sub { font-size:11px; color:rgba(255,255,255,0.32); margin-top:2px; }
+.tmrw-top { font-size:13px; font-weight:600; color:rgba(255,255,255,0.9); margin-bottom:8px; }
+.hyd-big { font-size:32px; font-weight:800; color:#7BD8FF; }
+.hyd-sub { font-size:12px; color:rgba(255,255,255,0.46); margin-top:3px; }
+.footer { display:flex; flex-wrap:wrap; gap:8px; padding-top:10px; margin-top:4px; border-top:1px solid rgba(255,255,255,0.08); }
+.si { display:flex; align-items:center; gap:5px; font-size:10px; color:rgba(255,255,255,0.4); }
+.dot { width:5px; height:5px; border-radius:50%; }
+.dot-green { background:#A0F0B0; } .dot-amber { background:#FFB450; } .dot-red { background:#FF6B6B; }
+</style></head>
+<body><div class="outer">
+  <div class="blob-tr"></div><div class="blob-bl"></div>
+  <div class="content">
+
+    <div class="header">
+      <div><div class="greeting">${greeting}, Shahar 👋</div><div class="date-sub">${dateStr}</div></div>
+      <div class="chip">${chipText}</div>
+    </div>
+
+    <div class="card">
+      <div class="lbl">Readiness Score</div>
+      <div class="rc-row">
+        <div class="rc-circle"><div class="rc-num">${readiness.score}</div><div class="rc-unit">/100</div></div>
+        <div class="rc-desc">${readiness.description}</div>
+      </div>
+    </div>
+
+    <div class="card ${recovery ? 'card-warn' : ''}">
+      <div class="lbl">Recovery Status</div>
+      ${recovery ? `
+      <div class="rec-top">
+        <div><div class="rec-title">${recovery.body_part}</div><div class="trend">${trendIcon}</div></div>
+        <div style="text-align:right"><div class="pain-big">${latestPainLevel ?? '—'}</div><div class="pain-sub">Pain /10</div></div>
+      </div>
+      <div class="pills">
+        <span class="pill pill-amber">Day ${dayNumber} recovery</span>
+        ${recovery.recommendation ? `<span class="pill pill-amber">${recovery.recommendation.split(' — ')[0]}</span>` : ''}
+        <span class="pill">${recovery.status}</span>
+      </div>` : `
+      <div style="display:flex;align-items:center;gap:10px">
+        <span style="font-size:22px">✅</span>
+        <span style="font-size:13px;color:rgba(255,255,255,0.72)">No active injuries — full training load OK</span>
+      </div>`}
+    </div>
+
+    <div class="card">
+      <div class="lbl">Weather Today</div>
+      ${weather ? `
+      <div class="wx-opt">Best window: ${weather.bestWindow.start}–${weather.bestWindow.end} <span class="wx-win">${weather.bestWindow.temp}°C</span></div>
+      <div class="wx-grid">
+        <div class="wx-stat"><div class="wx-val">${weather.current.temp}°</div><div class="wx-lbl">Now</div></div>
+        <div class="wx-stat"><div class="wx-val">${weather.peak.temp}°</div><div class="wx-lbl">Peak ${weather.peak.time}</div></div>
+        <div class="wx-stat"><div class="wx-val">${weather.current.humidity}%</div><div class="wx-lbl">Humidity</div></div>
+      </div>` : `<div style="font-size:13px;color:rgba(255,255,255,0.48)">Weather unavailable</div>`}
+    </div>
+
+    <div class="card">
+      <div class="lbl" style="margin-bottom:4px">Today's Rehab</div>
+      ${rehab ? `
+      <div style="font-size:11px;color:rgba(255,255,255,0.48);margin-bottom:6px">${rehab.label}</div>
+      ${rehab.strengthening.length ? `<div class="ex-sec">Strengthening</div>${exRows(rehab.strengthening)}` : ''}
+      <div class="ex-sec" style="margin-top:${rehab.strengthening.length ? '10px' : '0'}">Stretching</div>
+      ${exRows(rehab.stretching)}` : `<div style="font-size:13px;color:rgba(255,255,255,0.48)">No active rehab protocol</div>`}
+    </div>
+
+    <div class="card">
+      <div class="lbl">Cross-Training Options</div>
+      <div class="pills">${pills(crossPills)}</div>
+    </div>
+
+    <div class="card">
+      <div class="lbl">Yesterday's Nutrition</div>
+      ${kcal ? `
+      <div class="nutr-top">
+        <div><div class="kcal-big">${kcal}</div><div class="kcal-sub">kcal</div></div>
+        <div class="nutr-right">
+          ${nutrition.sodium_mg ? `<div class="nutr-line">Sodium <span class="nutr-val">${nutrition.sodium_mg}mg</span></div>` : ''}
+          ${nutrition.sugar_g  ? `<div class="nutr-line">Sugar <span class="nutr-val">${nutrition.sugar_g}g</span></div>` : ''}
+          ${nutrition.fiber_g  ? `<div class="nutr-line">Fiber <span class="nutr-val">${nutrition.fiber_g}g</span></div>` : ''}
+        </div>
+      </div>
+      <div class="macro-bar"><div class="mp"></div><div class="mc"></div><div class="mf"></div></div>
+      <div class="macro-lbls">
+        <div class="mlbl">Protein <b>${protein}g</b></div>
+        <div class="mlbl">Carbs <b>${carbs}g</b></div>
+        <div class="mlbl">Fat <b>${fat}g</b></div>
+      </div>` : `<div style="font-size:13px;color:rgba(255,255,255,0.48)">No nutrition data — check MFP diary</div>`}
+    </div>
+
+    <div class="card">
+      <div class="lbl">Sleep &amp; Recovery</div>
+      <div class="sleep-row">
+        <div class="sleep-icon">⌚</div>
+        <div><div class="sleep-txt">Garmin integration pending</div><div class="sleep-sub">HRV · sleep stages · recovery score coming soon</div></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="lbl">Tomorrow's Outlook</div>
+      ${weather?.tomorrow ? `
+      <div class="tmrw-top">${weather.tomorrow.isHot ? '🌡️ ' : ''}${weather.tomorrow.description ?? 'Forecast available'}${weather.tomorrow.peak ? ` · Peak ${weather.tomorrow.peak}°C` : ''}</div>
+      <div class="pills">
+        ${weather.tomorrow.isHot ? '<span class="pill pill-amber">Heat warning</span>' : ''}
+        ${weather.tomorrow.description ? `<span class="pill">${weather.tomorrow.description}</span>` : ''}
+        ${weather.tomorrow.peak ? `<span class="pill">${weather.tomorrow.peak}°C tomorrow</span>` : ''}
+      </div>` : `<div style="font-size:13px;color:rgba(255,255,255,0.48)">Forecast unavailable</div>`}
+    </div>
+
+    <div class="card">
+      <div class="lbl">Hydration Goal</div>
+      <div class="hyd-big">${hydration.toFixed(1)}L</div>
+      <div class="hyd-sub">${hydration > 2.5 ? 'Base 2.5L + 1L for planned run' : 'Base daily target — no run planned'}</div>
+    </div>
+
+    <div class="footer">
+      <div class="si"><div class="dot dot-green"></div>Strava</div>
+      <div class="si"><div class="dot dot-green"></div>OpenWeather</div>
+      <div class="si"><div class="dot ${mfpStatus}"></div>MFP</div>
+      <div class="si"><div class="dot dot-amber"></div>Garmin</div>
+      <div class="si"><div class="dot dot-green"></div>Telegram</div>
+    </div>
+
+  </div>
+</div></body></html>`;
+}
+
+async function generateBriefingImage() {
+  const data = await getBriefingData();
+  const html = buildBriefingHTML(data);
+
+  let browser;
+  try {
+    if (process.platform === 'linux') {
+      const chromium = require('@sparticuz/chromium');
+      const puppeteerCore = require('puppeteer-core');
+      browser = await puppeteerCore.launch({
+        args: chromium.args,
+        defaultViewport: { width: 520, height: 1400, deviceScaleFactor: 2 },
+        executablePath: await chromium.executablePath(),
+        headless: chromium.headless,
+      });
+    } else {
+      browser = await puppeteer.launch({
+        headless: 'new',
+        args: ['--no-sandbox', '--disable-setuid-sandbox'],
+        defaultViewport: { width: 520, height: 1400, deviceScaleFactor: 2 },
+      });
+    }
+    const page = await browser.newPage();
+    await page.setContent(html, { waitUntil: 'networkidle0' });
+    const buffer = await page.screenshot({ type: 'png', fullPage: true });
+    console.log('[briefing] Screenshot taken, buffer size:', buffer.length);
+    return buffer;
+  } finally {
+    if (browser) await browser.close().catch(() => {});
+  }
+}
+
+async function sendTelegramPhoto(chatId, imageBuffer, caption) {
+  const boundary = `----FormBoundary${Date.now().toString(16)}`;
+  let head = '';
+  head += `--${boundary}\r\nContent-Disposition: form-data; name="chat_id"\r\n\r\n${chatId}\r\n`;
+  if (caption) head += `--${boundary}\r\nContent-Disposition: form-data; name="caption"\r\n\r\n${caption}\r\n`;
+  head += `--${boundary}\r\nContent-Disposition: form-data; name="photo"; filename="briefing.png"\r\nContent-Type: image/png\r\n\r\n`;
+
+  const body = Buffer.concat([
+    Buffer.from(head, 'utf8'),
+    imageBuffer,
+    Buffer.from(`\r\n--${boundary}--\r\n`, 'utf8'),
+  ]);
+
+  const r = await fetch(
+    `https://api.telegram.org/bot${process.env.TELEGRAM_BOT_TOKEN}/sendPhoto`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': `multipart/form-data; boundary=${boundary}` },
+      body,
+    }
+  );
+  if (!r.ok) {
+    const text = await r.text();
+    console.error('[telegram] sendPhoto HTTP', r.status, text);
+    throw new Error(`sendPhoto HTTP ${r.status}`);
+  }
+}
+
 async function generateMorningBriefing() {
   const [forecast, recoverySession] = await Promise.all([getWeatherForecast(), getActiveRecoverySession()]);
   const { sunrise, sunset } = calculateSunriseSunset();
@@ -1777,12 +2187,18 @@ cron.schedule('0 7 * * *', async () => {
   console.log('[briefing] Sending morning briefing');
   try {
     const recovery = await getActiveRecoverySession();
-    if (recovery?.status === 'active') {
-      await sendMorningPainCheck();
-    } 
-    const message = await generateMorningBriefing();
-    await sendTelegram(process.env.TELEGRAM_OWNER_CHAT_ID, message);
-    console.log('[briefing] Sent successfully');
+    if (recovery?.status === 'active') await sendMorningPainCheck();
+    const today = new Date().toLocaleDateString('en-GB', { day: 'numeric', month: 'long', timeZone: 'Asia/Jerusalem' });
+    try {
+      const imageBuffer = await generateBriefingImage();
+      await sendTelegramPhoto(process.env.TELEGRAM_OWNER_CHAT_ID, imageBuffer, `🌅 Your briefing for ${today} · tap for details`);
+      console.log('[briefing] Image sent successfully');
+    } catch (imgErr) {
+      console.error('[briefing] Image generation failed, falling back to text:', imgErr.message, imgErr.stack);
+      const message = await generateMorningBriefing();
+      await sendTelegram(process.env.TELEGRAM_OWNER_CHAT_ID, message);
+      console.log('[briefing] Text fallback sent');
+    }
   } catch (err) {
     console.error('[briefing] Error:', err.message);
   }
