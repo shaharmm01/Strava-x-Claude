@@ -2,3 +2,4 @@
 node_modules/
 .DS_Store
 _env
+.claude/worktrees/intelligent-aryabhata-13f82e/

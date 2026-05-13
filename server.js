@@ -8,6 +8,7 @@ const cron = require('node-cron');
 const axios = require('axios');
 const cheerio = require('cheerio');
 const puppeteer = require('puppeteer');
+const garmin = require('./garmin');
 
 const app = express();
 app.use(express.json());
@@ -53,6 +54,20 @@ app.get('/weekly/:secret', async (req, res) => {
     console.log('[weekly] Manual trigger sent');
   } catch (err) {
     console.error('[weekly] Manual trigger error:', err.message);
+  }
+});
+
+// Manual Garmin sync trigger: GET /sync_garmin/:secret
+app.get('/sync_garmin/:secret', async (req, res) => {
+  if (req.params.secret !== process.env.COMPOSIO_WEBHOOK_SECRET) return res.status(401).send('Unauthorized');
+  res.status(200).send('Garmin sync started');
+  try {
+    await sendTelegram(process.env.TELEGRAM_OWNER_CHAT_ID, '⌚ Garmin sync started — pulling 30 days of data...');
+    const count = await garmin.syncGarminHistory(30);
+    await sendTelegram(process.env.TELEGRAM_OWNER_CHAT_ID, `✅ Garmin sync complete — ${count} days synced`);
+  } catch (err) {
+    console.error('[sync_garmin] Error:', err.message);
+    await sendTelegram(process.env.TELEGRAM_OWNER_CHAT_ID, `❌ Garmin sync failed: ${err.message}`).catch(() => {});
   }
 });
 
@@ -380,6 +395,31 @@ app.post('/webhook/telegram', (req, res) => {
     const d = new Date();
     const label = d.toLocaleDateString('en-GB', { weekday: 'long', day: 'numeric', month: 'short' });
     handleNutrition(chatId, d.toISOString().slice(0, 10), label).catch(err => console.error('[nutrition] Error:', err.message));
+  } else if (/^\/garmin$/i.test(text)) {
+    handleGarminSnapshot(chatId).catch(err => console.error('[garmin] Error:', err.message));
+  } else if (/^\/sleep$/i.test(text)) {
+    handleGarminSleep(chatId).catch(err => console.error('[garmin] Error:', err.message));
+  } else if (/^\/readiness$/i.test(text)) {
+    handleGarminReadiness(chatId).catch(err => console.error('[garmin] Error:', err.message));
+  } else if (/^\/recovery$/i.test(text)) {
+    handleGarminRecovery(chatId).catch(err => console.error('[garmin] Error:', err.message));
+  } else if (/^\/vo2$/i.test(text)) {
+    handleGarminVO2(chatId).catch(err => console.error('[garmin] Error:', err.message));
+  } else if (/^\/race$/i.test(text)) {
+    handleGarminRace(chatId).catch(err => console.error('[garmin] Error:', err.message));
+  } else if (/^\/training$/i.test(text)) {
+    handleGarminTraining(chatId).catch(err => console.error('[garmin] Error:', err.message));
+  } else if (/^\/shoes$/i.test(text)) {
+    handleGarminShoes(chatId).catch(err => console.error('[garmin] Error:', err.message));
+  } else if (/^\/garmin_week$/i.test(text)) {
+    handleGarminWeek(chatId).catch(err => console.error('[garmin] Error:', err.message));
+  } else if (/^\/garmin_status$/i.test(text)) {
+    handleGarminStatus(chatId).catch(err => console.error('[garmin] Error:', err.message));
+  } else if (/^\/sync_garmin$/i.test(text)) {
+    sendTelegram(chatId, '⌚ Starting Garmin sync...').catch(() => {});
+    garmin.syncGarminHistory(30)
+      .then(count => sendTelegram(chatId, `✅ Garmin sync complete — ${count} days synced`))
+      .catch(err => sendTelegram(chatId, `❌ Garmin sync failed: ${err.message}`).catch(() => {}));
   } else {
     getBotState('conversation').then(state => {
       if (state?.step) {
@@ -406,6 +446,78 @@ async function sendTelegram(chatId, text) {
     }
   );
   if (!r.ok) console.error('[telegram] sendMessage HTTP', r.status);
+}
+
+// ── Garmin command handlers ───────────────────────────────────────────────────
+
+async function handleGarminSnapshot(chatId) {
+  const yesterday = new Date(Date.now() - 86400000).toISOString().slice(0, 10);
+  const data = await garmin.getLatestGarminData(yesterday);
+  const msg = garmin.formatGarminSnapshot(data, yesterday);
+  await sendTelegram(chatId, msg);
+}
+
+async function handleGarminSleep(chatId) {
+  const yesterday = new Date(Date.now() - 86400000).toISOString().slice(0, 10);
+  const data = await garmin.getLatestGarminData(yesterday);
+  const msg = garmin.formatSleepDetail(data?.sleep, yesterday);
+  await sendTelegram(chatId, msg);
+}
+
+async function handleGarminReadiness(chatId) {
+  const yesterday = new Date(Date.now() - 86400000).toISOString().slice(0, 10);
+  const data = await garmin.getLatestGarminData(yesterday);
+  const msg = garmin.formatReadiness(data?.training, yesterday);
+  await sendTelegram(chatId, msg);
+}
+
+async function handleGarminRecovery(chatId) {
+  const yesterday = new Date(Date.now() - 86400000).toISOString().slice(0, 10);
+  const data = await garmin.getLatestGarminData(yesterday);
+  const msg = garmin.formatRecovery(data, yesterday);
+  await sendTelegram(chatId, msg);
+}
+
+async function handleGarminVO2(chatId) {
+  const yesterday = new Date(Date.now() - 86400000).toISOString().slice(0, 10);
+  const data = await garmin.getLatestGarminData(yesterday);
+  const msg = garmin.formatVO2(data?.training, yesterday);
+  await sendTelegram(chatId, msg);
+}
+
+async function handleGarminRace(chatId) {
+  const yesterday = new Date(Date.now() - 86400000).toISOString().slice(0, 10);
+  const data = await garmin.getLatestGarminData(yesterday);
+  const msg = garmin.formatRace(data?.race, yesterday);
+  await sendTelegram(chatId, msg);
+}
+
+async function handleGarminTraining(chatId) {
+  const yesterday = new Date(Date.now() - 86400000).toISOString().slice(0, 10);
+  const data = await garmin.getLatestGarminData(yesterday);
+  const msg = garmin.formatTraining(data?.training, yesterday);
+  await sendTelegram(chatId, msg);
+}
+
+async function handleGarminShoes(chatId) {
+  const msg = await garmin.formatShoes();
+  await sendTelegram(chatId, msg);
+}
+
+async function handleGarminWeek(chatId) {
+  const summary = await garmin.getGarminWeekSummary();
+  const msg = garmin.formatGarminWeekSummary(summary);
+  await sendTelegram(chatId, msg);
+}
+
+async function handleGarminStatus(chatId) {
+  const { data } = await supabase.from('daily_garmin_sleep').select('date').order('date', { ascending: false }).limit(1);
+  const lastSync = data?.[0]?.date;
+  if (lastSync) {
+    await sendTelegram(chatId, `⌚ Garmin last synced: ${lastSync}\nAll health tables active — use /garmin for today's snapshot`);
+  } else {
+    await sendTelegram(chatId, '⌚ Garmin: no data yet — trigger /sync_garmin to pull history');
+  }
 }
 
 function isWeatherQuestion(text) {
@@ -1336,7 +1448,13 @@ async function getRehabDataStructured(session, painLevel) {
   };
 }
 
-function calculateReadinessScore(painLevel, recoverySession) {
+function calculateReadinessScore(painLevel, recoverySession, garminReadiness) {
+  if (garminReadiness?.readiness_score) {
+    const s = garminReadiness.readiness_score;
+    const cls = garminReadiness.readiness_classification ?? (s >= 70 ? 'Optimal' : s >= 50 ? 'Good' : s >= 30 ? 'Fair' : 'Poor');
+    const level = s >= 70 ? 'good' : s >= 55 ? 'moderate' : s >= 40 ? 'caution' : s >= 25 ? 'low' : 'critical';
+    return { score: s, description: `${cls} readiness — Garmin Training Readiness`, level };
+  }
   if (!recoverySession) return { score: 75, description: 'No active injury — full training load OK', level: 'good' };
   const pain = painLevel ?? 5;
   if (pain <= 2) return { score: 70, description: 'Low pain — light activity OK', level: 'moderate' };
@@ -1347,11 +1465,12 @@ function calculateReadinessScore(painLevel, recoverySession) {
 
 async function getBriefingData() {
   const yesterday = new Date(Date.now() - 86400000).toISOString().slice(0, 10);
-  const [weatherData, recoverySession, nutrition, plan] = await Promise.all([
+  const [weatherData, recoverySession, nutrition, plan, garminData] = await Promise.all([
     getStructuredWeather().catch(() => null),
     getActiveRecoverySession(),
     getStoredNutrition(yesterday),
     getTodayPlan().catch(() => null),
+    garmin.getLatestGarminData(yesterday).catch(() => null),
   ]);
 
   let painTrend = null, latestPainLevel = null, rehab = null, crossTraining = null, dayNumber = null;
@@ -1371,17 +1490,17 @@ async function getBriefingData() {
     crossTraining = getAlternativeActivities(recoverySession.body_part);
   }
 
-  const readiness = calculateReadinessScore(latestPainLevel, recoverySession);
+  const readiness = calculateReadinessScore(latestPainLevel, recoverySession, garminData?.training);
   const hasRun = !!(plan?.distance_km || plan?.workout_type?.toLowerCase().includes('run'));
   const hydration = hasRun ? 3.5 : 2.5;
   const dateStr = new Date().toLocaleDateString('en-GB', {
     weekday: 'long', day: 'numeric', month: 'long', year: 'numeric', timeZone: 'Asia/Jerusalem',
   });
-  return { dateStr, weather: weatherData, recovery: recoverySession, painTrend, latestPainLevel, rehab, crossTraining, dayNumber, nutrition, readiness, hydration, plan };
+  return { dateStr, weather: weatherData, recovery: recoverySession, painTrend, latestPainLevel, rehab, crossTraining, dayNumber, nutrition, readiness, hydration, plan, garminData };
 }
 
 function buildBriefingHTML(d) {
-  const { dateStr, weather, recovery, painTrend, latestPainLevel, rehab, crossTraining, dayNumber, nutrition, readiness, hydration } = d;
+  const { dateStr, weather, recovery, painTrend, latestPainLevel, rehab, crossTraining, dayNumber, nutrition, readiness, hydration, garminData } = d;
 
   const rcColor = { good: '#5BB4FF', moderate: '#7BD8FF', caution: '#FFB450', low: '#FF9A6B', critical: '#FF6B6B' }[readiness.level] ?? '#5BB4FF';
   const rcBg   = { good: 'rgba(91,180,255,0.15)', moderate: 'rgba(123,216,255,0.15)', caution: 'rgba(255,180,80,0.15)', low: 'rgba(255,154,107,0.15)', critical: 'rgba(255,107,107,0.15)' }[readiness.level] ?? 'rgba(91,180,255,0.15)';
@@ -1469,6 +1588,23 @@ body { width:520px; background:linear-gradient(135deg,#061B33 0%,#0A2C52 50%,#0F
 .sleep-icon { font-size:26px; }
 .sleep-txt { font-size:13px; color:rgba(255,255,255,0.52); }
 .sleep-sub { font-size:11px; color:rgba(255,255,255,0.32); margin-top:2px; }
+.gm-grid { display:grid; grid-template-columns:1fr 1fr; gap:8px; }
+.gm-stat { display:flex; flex-direction:column; }
+.gm-val { font-size:18px; font-weight:700; color:#fff; line-height:1.1; }
+.gm-lbl { font-size:10px; color:rgba(255,255,255,0.4); margin-top:2px; text-transform:uppercase; letter-spacing:0.5px; }
+.gm-badge { display:inline-block; font-size:10px; font-weight:600; padding:2px 8px; border-radius:10px; margin-top:4px; }
+.badge-green { background:rgba(160,240,176,0.18); color:#A0F0B0; border:1px solid rgba(160,240,176,0.3); }
+.badge-amber { background:rgba(255,180,80,0.18); color:#FFB450; border:1px solid rgba(255,180,80,0.3); }
+.badge-red { background:rgba(255,107,107,0.18); color:#FF6B6B; border:1px solid rgba(255,107,107,0.3); }
+.badge-blue { background:rgba(91,180,255,0.18); color:#5BB4FF; border:1px solid rgba(91,180,255,0.3); }
+.gm-row { display:flex; justify-content:space-between; align-items:center; padding:4px 0; border-bottom:1px solid rgba(255,255,255,0.05); }
+.gm-row:last-child { border-bottom:none; }
+.gm-key { font-size:12px; color:rgba(255,255,255,0.5); }
+.gm-v { font-size:12px; font-weight:600; color:rgba(255,255,255,0.85); }
+.race-grid { display:grid; grid-template-columns:1fr 1fr; gap:6px; margin-top:4px; }
+.race-item { background:rgba(255,255,255,0.05); border-radius:8px; padding:8px 10px; }
+.race-dist { font-size:10px; color:rgba(255,255,255,0.4); text-transform:uppercase; letter-spacing:0.5px; }
+.race-time { font-size:15px; font-weight:700; color:#7BD8FF; margin-top:2px; }
 .tmrw-top { font-size:13px; font-weight:600; color:rgba(255,255,255,0.9); margin-bottom:8px; }
 .hyd-big { font-size:32px; font-weight:800; color:#7BD8FF; }
 .hyd-sub { font-size:12px; color:rgba(255,255,255,0.46); margin-top:3px; }
@@ -1556,13 +1692,88 @@ body { width:520px; background:linear-gradient(135deg,#061B33 0%,#0A2C52 50%,#0F
       </div>` : `<div style="font-size:13px;color:rgba(255,255,255,0.48)">No nutrition data — check MFP diary</div>`}
     </div>
 
+    ${garminData ? (() => {
+      const sl = garminData.sleep;
+      const hr = garminData.hrv;
+      const bb = garminData.bodyBattery;
+      const tr = garminData.training;
+      const vt = garminData.vitals;
+      const rc = garminData.race;
+
+      const fmtSec = (s) => { if (!s) return '—'; const h = Math.floor(s/3600), m = Math.floor((s%3600)/60); return `${h}h ${String(m).padStart(2,'0')}m`; };
+      const fmtRT = (s) => { if (!s) return '—'; const h = Math.floor(s/3600), m = Math.floor((s%3600)/60), sec = s%60; return h > 0 ? `${h}:${String(m).padStart(2,'0')}:${String(sec).padStart(2,'0')}` : `${m}:${String(sec).padStart(2,'0')}`; };
+
+      const hvBadge = (status) => {
+        if (!status) return '';
+        const cls = { balanced:'badge-green', positive:'badge-green', good:'badge-green', unbalanced:'badge-amber', poor:'badge-red', low:'badge-red' }[status?.toLowerCase()] ?? 'badge-blue';
+        return `<span class="gm-badge ${cls}">${status}</span>`;
+      };
+      const rdBadge = (score) => {
+        if (!score) return '';
+        const cls = score >= 70 ? 'badge-green' : score >= 50 ? 'badge-amber' : 'badge-red';
+        return `<span class="gm-badge ${cls}">${score}</span>`;
+      };
+      const tsBadge = (status) => {
+        if (!status) return '';
+        const cls = { productive:'badge-green', maintaining:'badge-blue', peaking:'badge-green', recovery:'badge-amber', overreaching:'badge-red', detraining:'badge-red' }[status?.toLowerCase()] ?? 'badge-blue';
+        return `<span class="gm-badge ${cls}">${status}</span>`;
+      };
+
+      return `
+    <div class="card">
+      <div class="lbl">Sleep</div>
+      <div class="gm-grid">
+        <div class="gm-stat"><div class="gm-val">${sl?.score ?? '—'}</div><div class="gm-lbl">Sleep Score</div>${hvBadge(sl?.sleep_score_feedback)}</div>
+        <div class="gm-stat"><div class="gm-val">${fmtSec(sl?.duration_seconds)}</div><div class="gm-lbl">Duration</div></div>
+        <div class="gm-stat"><div class="gm-val">${fmtSec(sl?.deep_seconds)}</div><div class="gm-lbl">Deep</div></div>
+        <div class="gm-stat"><div class="gm-val">${fmtSec(sl?.rem_seconds)}</div><div class="gm-lbl">REM</div></div>
+      </div>
+      ${sl?.avg_respiration || sl?.avg_spo2 ? `<div style="margin-top:8px;display:flex;gap:16px">
+        ${sl?.avg_respiration ? `<div class="gm-stat"><div class="gm-val" style="font-size:14px">${sl.avg_respiration.toFixed(1)}</div><div class="gm-lbl">Respiration</div></div>` : ''}
+        ${sl?.avg_spo2 ? `<div class="gm-stat"><div class="gm-val" style="font-size:14px">${sl.avg_spo2.toFixed(1)}%</div><div class="gm-lbl">SpO₂</div></div>` : ''}
+        ${sl?.resting_hr ? `<div class="gm-stat"><div class="gm-val" style="font-size:14px">${sl.resting_hr}</div><div class="gm-lbl">RHR</div></div>` : ''}
+      </div>` : ''}
+    </div>
+
+    <div class="card">
+      <div class="lbl">Recovery Snapshot</div>
+      <div class="gm-grid">
+        <div class="gm-stat"><div class="gm-val">${hr?.last_night_ms ? `${Math.round(hr.last_night_ms)}ms` : '—'}</div><div class="gm-lbl">HRV</div>${hvBadge(hr?.hrv_status)}</div>
+        <div class="gm-stat"><div class="gm-val">${bb?.morning_value != null ? `${bb.morning_value}%` : '—'}</div><div class="gm-lbl">Body Battery</div>${bb?.morning_value != null ? `<span class="gm-badge ${bb.morning_value >= 60 ? 'badge-green' : bb.morning_value >= 30 ? 'badge-amber' : 'badge-red'}">${bb.charged != null ? `+${bb.charged}` : ''} overnight</span>` : ''}</div>
+        <div class="gm-stat"><div class="gm-val">${tr?.readiness_score ?? '—'}</div><div class="gm-lbl">Readiness</div>${rdBadge(tr?.readiness_score)}</div>
+        <div class="gm-stat"><div class="gm-val">${vt?.skin_temp_deviation != null ? `${vt.skin_temp_deviation > 0 ? '+' : ''}${vt.skin_temp_deviation.toFixed(1)}°` : '—'}</div><div class="gm-lbl">Skin Temp Δ</div></div>
+      </div>
+      ${hr?.baseline_balanced_low && hr?.baseline_balanced_high ? `<div style="margin-top:6px;font-size:11px;color:rgba(255,255,255,0.38)">HRV baseline ${Math.round(hr.baseline_balanced_low)}–${Math.round(hr.baseline_balanced_high)}ms</div>` : ''}
+    </div>
+
+    <div class="card">
+      <div class="lbl">Training Status</div>
+      <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:8px">
+        <div><div style="font-size:14px;font-weight:600;color:rgba(255,255,255,0.85)">${tr?.training_status ?? '—'}</div>${tsBadge(tr?.training_status)}</div>
+        ${tr?.vo2max ? `<div class="gm-stat" style="text-align:right"><div class="gm-val">${tr.vo2max.toFixed(1)}</div><div class="gm-lbl">VO₂ Max</div></div>` : ''}
+      </div>
+      <div class="gm-row"><span class="gm-key">Training Load</span><span class="gm-v">${tr?.training_load ? `${Math.round(tr.training_load)} (${tr.training_load_status ?? ''})` : '—'}</span></div>
+      <div class="gm-row"><span class="gm-key">Recovery Time</span><span class="gm-v">${tr?.recovery_time_hours ? `${Math.round(tr.recovery_time_hours)}h remaining` : '—'}</span></div>
+      ${tr?.fitness_age ? `<div class="gm-row"><span class="gm-key">Fitness Age</span><span class="gm-v">${tr.fitness_age}</span></div>` : ''}
+    </div>
+
+    ${rc?.time_5k_secs || rc?.time_10k_secs ? `<div class="card">
+      <div class="lbl">Race Predictions</div>
+      <div class="race-grid">
+        ${rc.time_5k_secs   ? `<div class="race-item"><div class="race-dist">5K</div><div class="race-time">${fmtRT(rc.time_5k_secs)}</div></div>` : ''}
+        ${rc.time_10k_secs  ? `<div class="race-item"><div class="race-dist">10K</div><div class="race-time">${fmtRT(rc.time_10k_secs)}</div></div>` : ''}
+        ${rc.time_half_secs ? `<div class="race-item"><div class="race-dist">Half</div><div class="race-time">${fmtRT(rc.time_half_secs)}</div></div>` : ''}
+        ${rc.time_full_secs ? `<div class="race-item"><div class="race-dist">Full</div><div class="race-time">${fmtRT(rc.time_full_secs)}</div></div>` : ''}
+      </div>
+    </div>` : ''}`;
+    })() : `
     <div class="card">
       <div class="lbl">Sleep &amp; Recovery</div>
       <div class="sleep-row">
         <div class="sleep-icon">⌚</div>
-        <div><div class="sleep-txt">Garmin integration pending</div><div class="sleep-sub">HRV · sleep stages · recovery score coming soon</div></div>
+        <div><div class="sleep-txt">Garmin syncing...</div><div class="sleep-sub">HRV · sleep stages · recovery score coming soon</div></div>
       </div>
-    </div>
+    </div>`}
 
     <div class="card">
       <div class="lbl">Tomorrow's Outlook</div>
@@ -1585,7 +1796,7 @@ body { width:520px; background:linear-gradient(135deg,#061B33 0%,#0A2C52 50%,#0F
       <div class="si"><div class="dot dot-green"></div>Strava</div>
       <div class="si"><div class="dot dot-green"></div>OpenWeather</div>
       <div class="si"><div class="dot ${mfpStatus}"></div>MFP</div>
-      <div class="si"><div class="dot dot-amber"></div>Garmin</div>
+      <div class="si"><div class="dot ${garminData ? 'dot-green' : 'dot-amber'}"></div>Garmin</div>
       <div class="si"><div class="dot dot-green"></div>Telegram</div>
     </div>
 
@@ -1737,7 +1948,22 @@ Keep it under 150 words. Start with today's date.`;
     if (activePain) recoveryLine = `\n\n⚠️ Active pain: ${activePain} — monitor today`;
   }
 
-  return `🌅 Morning Briefing\n\n${response.content[0].text}${nutritionLine}${planLine}${recoveryLine}\n\n— Garmin recovery coming soon`;
+  const garminData = await garmin.getLatestGarminData(yesterday).catch(() => null);
+  let garminLine = '';
+  if (garminData?.hrv || garminData?.bodyBattery || garminData?.sleep) {
+    const gParts = [];
+    if (garminData.hrv?.last_night_ms) gParts.push(`💓 HRV: ${Math.round(garminData.hrv.last_night_ms)}ms (${garminData.hrv.hrv_status ?? '—'})`);
+    if (garminData.bodyBattery?.morning_value != null) gParts.push(`🔋 Battery: ${garminData.bodyBattery.morning_value}%`);
+    if (garminData.sleep?.duration_seconds) {
+      const h = Math.floor(garminData.sleep.duration_seconds / 3600);
+      const m = Math.floor((garminData.sleep.duration_seconds % 3600) / 60);
+      gParts.push(`😴 Sleep: ${h}h${m > 0 ? `${m}m` : ''}${garminData.sleep.score ? ` score ${garminData.sleep.score}` : ''}`);
+    }
+    if (gParts.length) garminLine = `\n\n${gParts.join(' · ')}`;
+  } else {
+    garminLine = '\n\n— Garmin recovery coming soon';
+  }
+  return `🌅 Morning Briefing\n\n${response.content[0].text}${nutritionLine}${planLine}${recoveryLine}${garminLine}`;
 }
 
 function getEffortMultiplier(paceSecPerKm) {
@@ -2084,6 +2310,29 @@ async function generateWeeklyReport() {
     lines.push(`🍽 Nutrition (${nutritionRows.length}-day avg): ${avg('calories')} kcal · ${avg('protein_g')}g protein · ${avg('carbs_g')}g carbs · ${avg('fat_g')}g fat · ${avg('sodium_mg')}mg sodium · ${avg('sugar_g')}g sugar · ${avg('fiber_g')}g fiber`);
   }
 
+  // ── Garmin weekly summary ──
+  try {
+    const gWeek = await garmin.getGarminWeekSummary();
+    if (gWeek) {
+      lines.push('');
+      lines.push('⌚ Garmin (7-day):');
+      if (gWeek.avg_sleep_duration || gWeek.avg_sleep_score) {
+        const durStr = gWeek.avg_sleep_duration ? (() => { const h = Math.floor(gWeek.avg_sleep_duration/3600), m = Math.floor((gWeek.avg_sleep_duration%3600)/60); return `${h}h${m > 0 ? `${m}m` : ''}`; })() : null;
+        lines.push(`  😴 Sleep: avg ${durStr ?? '—'} · score ${gWeek.avg_sleep_score ?? '—'} · poor nights: ${gWeek.poor_sleep_nights ?? 0}`);
+      }
+      if (gWeek.avg_hrv) lines.push(`  💓 HRV: avg ${Math.round(gWeek.avg_hrv)}ms · trend ${gWeek.hrv_trend ?? '→'}`);
+      if (gWeek.lowest_body_battery != null) lines.push(`  🔋 Body battery: lowest ${gWeek.lowest_body_battery}%${gWeek.lowest_battery_day ? ` on ${gWeek.lowest_battery_day}` : ''}`);
+      if (gWeek.avg_rhr) lines.push(`  ❤️ RHR: avg ${Math.round(gWeek.avg_rhr)} bpm${gWeek.rhr_delta != null ? ` (${gWeek.rhr_delta > 0 ? '+' : ''}${Math.round(gWeek.rhr_delta)} vs last week)` : ''}`);
+      if (gWeek.avg_vo2max) lines.push(`  📈 VO₂ Max: ${gWeek.avg_vo2max.toFixed(1)}${gWeek.vo2max_delta != null ? ` (${gWeek.vo2max_delta >= 0 ? '+' : ''}${gWeek.vo2max_delta.toFixed(1)} vs last week)` : ''}`);
+      if (gWeek.training_status) lines.push(`  🏋️ Training: ${gWeek.training_status}`);
+      if (gWeek.total_steps) lines.push(`  👟 Steps: ${gWeek.total_steps.toLocaleString()} · intensity ${gWeek.total_intensity_mins ?? 0}min / 150min WHO target`);
+      if (gWeek.primary_shoe) lines.push(`  👟 ${gWeek.primary_shoe.name}: ${Math.round((gWeek.primary_shoe.distance_m ?? 0) / 1000)}km${(gWeek.primary_shoe.distance_m ?? 0) > 600000 ? ' ⚠️ approaching 700km' : ''}`);
+      if (gWeek.race_5k || gWeek.race_10k) lines.push(`  🏁 Race predictions: ${gWeek.race_5k ? `5K ${gWeek.race_5k}` : ''} ${gWeek.race_10k ? `· 10K ${gWeek.race_10k}` : ''}`);
+    }
+  } catch (gErr) {
+    console.error('[weekly] Garmin section error:', gErr.message);
+  }
+
   lines.push('');
   lines.push('📋 TrainingPeaks: coming soon');
 
@@ -2179,6 +2428,22 @@ cron.schedule('0 8 * * 1', async () => {
     console.log('[overtraining] Done');
   } catch (err) {
     console.error('[overtraining] Error:', err.message);
+  }
+}, { timezone: 'Asia/Jerusalem' });
+
+// Daily Garmin sync at 6:30am Israel time — yesterday's data
+cron.schedule('30 6 * * *', async () => {
+  const yesterday = new Date(Date.now() - 86400000).toISOString().slice(0, 10);
+  console.log('[garmin-cron] Syncing', yesterday);
+  try {
+    const data = await garmin.syncGarminDay(yesterday);
+    const alerts = await garmin.runSmartAlerts(data);
+    for (const alert of alerts) {
+      await sendTelegram(process.env.TELEGRAM_OWNER_CHAT_ID, alert).catch(() => {});
+    }
+    console.log('[garmin-cron] Done, alerts sent:', alerts.length);
+  } catch (err) {
+    console.error('[garmin-cron] Error:', err.message);
   }
 }, { timezone: 'Asia/Jerusalem' });
 
