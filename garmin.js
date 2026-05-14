@@ -36,11 +36,15 @@ function fmtRaceTime(secs) {
 
 async function garminLogin() {
   const gc = new GarminConnect({
-    username: process.env.GARMIN_USERNAME,
-    password: process.env.GARMIN_PASSWORD,
+    username: process.env.GARMIN_USERNAME ?? '',
+    password: process.env.GARMIN_PASSWORD ?? '',
   });
   try {
-    await gc.login();
+    if (process.env.GARMIN_OAUTH1 && process.env.GARMIN_OAUTH2) {
+      gc.loadToken(JSON.parse(process.env.GARMIN_OAUTH1), JSON.parse(process.env.GARMIN_OAUTH2));
+    } else {
+      await gc.login();
+    }
   } catch (err) {
     throw new Error(`Garmin login failed: ${safeErr(err)}`);
   }
@@ -413,9 +417,9 @@ async function storeRacePredictions(dateStr, rp) {
 
 // ── Main Sync ─────────────────────────────────────────────────────────────────
 
-async function syncGarminDay(dateStr) {
+async function syncGarminDay(dateStr, session = null) {
   console.log(`[garmin] Syncing ${dateStr}`);
-  const { gc, displayName, userProfilePK } = await garminLogin();
+  const { gc, displayName, userProfilePK } = session ?? await garminLogin();
 
   const [sleep, hrv, bb, stress, readiness, trainingStatus, vo2, racePredictions,
     activity, respiration, spo2, skinTemp, gear, weight, hr, hydration] = await Promise.all([
@@ -465,17 +469,18 @@ async function syncGarminDay(dateStr) {
 
 async function syncGarminHistory(days = 30) {
   console.log(`[garmin] Starting ${days}-day historical sync`);
+  const session = await garminLogin(); // login once, reuse for all days
   let synced = 0;
   for (let i = days; i >= 1; i--) {
     const d = new Date(Date.now() - i * 86400000);
     const dateStr = d.toISOString().slice(0, 10);
     try {
-      await syncGarminDay(dateStr);
+      await syncGarminDay(dateStr, session);
       synced++;
     } catch (err) {
       console.error(`[garmin] History sync failed for ${dateStr}:`, safeErr(err));
     }
-    await new Promise(r => setTimeout(r, 1200)); // rate limit buffer
+    await new Promise(r => setTimeout(r, 800));
   }
   console.log(`[garmin] Historical sync done — ${synced}/${days} days`);
   return synced;
