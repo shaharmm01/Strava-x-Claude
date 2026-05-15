@@ -1,7 +1,7 @@
 'use strict';
 
 require('dotenv').config();
-const { GarminConnect } = require('garmin-connect');
+const axios = require('axios');
 const { createClient } = require('@supabase/supabase-js');
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
@@ -32,180 +32,146 @@ function fmtRaceTime(secs) {
   return `${m}:${String(s).padStart(2, '0')}`;
 }
 
-// ── Session ───────────────────────────────────────────────────────────────────
+// ── Auth ──────────────────────────────────────────────────────────────────────
 
-async function garminLogin() {
-  const gc = new GarminConnect({
-    username: process.env.GARMIN_USERNAME ?? '',
-    password: process.env.GARMIN_PASSWORD ?? '',
-  });
-  try {
-    if (process.env.GARMIN_OAUTH1 && process.env.GARMIN_OAUTH2) {
-      gc.loadToken(JSON.parse(process.env.GARMIN_OAUTH1), JSON.parse(process.env.GARMIN_OAUTH2));
-    } else {
-      await gc.login();
-    }
-  } catch (err) {
-    throw new Error(`Garmin login failed: ${safeErr(err)}`);
+let _cachedToken = null;
+
+async function getAccessToken() {
+  // Plain token string — easiest to set in Railway
+  if (process.env.GARMIN_ACCESS_TOKEN) return process.env.GARMIN_ACCESS_TOKEN;
+
+  let oauth2 = {};
+  try { oauth2 = JSON.parse(process.env.GARMIN_OAUTH2 ?? '{}'); } catch (_) {}
+
+  const now = Date.now() / 1000;
+
+  if (_cachedToken?.expires_at > now + 60) return _cachedToken.access_token;
+
+  if (oauth2.expires_at > now + 60) {
+    _cachedToken = oauth2;
+    return oauth2.access_token;
   }
-  let displayName = null;
-  let userProfilePK = null;
-  try {
-    const profile = await gc.getUserProfile();
-    displayName = profile?.displayName ?? null;
-    userProfilePK = profile?.userProfilePK ?? profile?.userProfileId ?? null;
-  } catch (_) {}
-  return { gc, displayName, userProfilePK };
+
+  if (oauth2.refresh_token && (oauth2.refresh_token_expires_at ?? Infinity) > now) {
+    try {
+      const resp = await axios.post(
+        'https://diauth.garmin.com/oauth-service/oauth/token',
+        new URLSearchParams({
+          grant_type: 'refresh_token',
+          refresh_token: oauth2.refresh_token,
+          client_id: 'GARMIN_CONNECT_MOBILE_ANDROID_DI',
+        }),
+        { headers: { 'Content-Type': 'application/x-www-form-urlencoded' } }
+      );
+      _cachedToken = {
+        ...oauth2,
+        access_token: resp.data.access_token,
+        expires_at: now + (resp.data.expires_in ?? 3600) - 60,
+      };
+      console.log('[garmin] Access token refreshed successfully');
+      return _cachedToken.access_token;
+    } catch (err) {
+      console.error('[garmin] Token refresh failed:', err.message);
+    }
+  }
+
+  if (!oauth2.access_token) throw new Error('[garmin] No access token — set GARMIN_ACCESS_TOKEN in Railway');
+  _cachedToken = oauth2;
+  return oauth2.access_token;
+}
+
+async function gcGet(path, params = {}) {
+  const token = await getAccessToken();
+  const resp = await axios.get(`${BASE}${path}`, {
+    headers: {
+      Authorization: `Bearer ${token}`,
+      'NK': 'NT',
+      'DI-Backend': 'connectapi.garmin.com',
+    },
+    params,
+  });
+  return resp.data;
 }
 
 // ── Per-Metric Fetchers ───────────────────────────────────────────────────────
 
-async function fetchSleepData(gc, dateStr) {
+async function fetchSleepData(dateStr) {
   try {
-    const date = new Date(dateStr);
-    return await gc.getSleepData(date);
+    return await gcGet('/sleep-service/sleep/dailySleepData', { date: dateStr });
   } catch (err) {
     console.error('[garmin] fetchSleepData error:', safeErr(err));
     return null;
   }
 }
 
-async function fetchHRVData(gc, dateStr) {
+async function fetchHRVData(dateStr) {
   try {
-    return await gc.get(`${BASE}/hrv-service/hrv/${dateStr}`);
+    return await gcGet(`/hrv-service/hrv/${dateStr}`);
   } catch (err) {
     console.error('[garmin] fetchHRVData error:', safeErr(err));
     return null;
   }
 }
 
-async function fetchBodyBattery(gc, dateStr) {
+async function fetchStressData(dateStr) {
   try {
-    return await gc.get(`${BASE}/wellness-service/wellness/bodyBattery/bulletinList`, {
-      startDate: dateStr,
-      endDate: dateStr,
-    });
-  } catch (err) {
-    console.error('[garmin] fetchBodyBattery error:', safeErr(err));
-    return null;
-  }
-}
-
-async function fetchStressData(gc, dateStr) {
-  try {
-    return await gc.get(`${BASE}/wellness-service/wellness/dailyStress/${dateStr}`);
+    return await gcGet(`/wellness-service/wellness/dailyStress/${dateStr}`);
   } catch (err) {
     console.error('[garmin] fetchStressData error:', safeErr(err));
     return null;
   }
 }
 
-async function fetchTrainingReadiness(gc, dateStr) {
+async function fetchTrainingReadiness(dateStr) {
   try {
-    return await gc.get(`${BASE}/metrics-service/metrics/trainingReadiness/${dateStr}`);
+    const data = await gcGet(`/metrics-service/metrics/trainingreadiness/${dateStr}`);
+    return Array.isArray(data) ? (data[0] ?? null) : (data ?? null);
   } catch (err) {
     console.error('[garmin] fetchTrainingReadiness error:', safeErr(err));
     return null;
   }
 }
 
-async function fetchTrainingStatus(gc, dateStr) {
+async function fetchTrainingStatus(dateStr) {
   try {
-    return await gc.get(`${BASE}/metrics-service/metrics/trainingstatus/aggregated/${dateStr}`);
+    return await gcGet(`/metrics-service/metrics/trainingstatus/aggregated/${dateStr}`);
   } catch (err) {
     console.error('[garmin] fetchTrainingStatus error:', safeErr(err));
     return null;
   }
 }
 
-async function fetchVO2Max(gc, dateStr) {
+async function fetchVO2Max(dateStr) {
   try {
-    return await gc.get(`${BASE}/metrics-service/metrics/maxmet/daily/${dateStr}/${dateStr}`);
+    return await gcGet(`/metrics-service/metrics/maxmet/daily/${dateStr}/${dateStr}`);
   } catch (err) {
     console.error('[garmin] fetchVO2Max error:', safeErr(err));
     return null;
   }
 }
 
-async function fetchRacePredictions(gc, dateStr) {
+async function fetchWeightData(dateStr) {
   try {
-    return await gc.get(`${BASE}/metrics-service/metrics/racepredictions/daily/${dateStr}/${dateStr}`);
-  } catch (err) {
-    console.error('[garmin] fetchRacePredictions error:', safeErr(err));
-    return null;
-  }
-}
-
-async function fetchDailyActivity(gc, dateStr, displayName) {
-  try {
-    if (!displayName) return null;
-    return await gc.get(`${BASE}/usersummary-service/usersummary/daily/${displayName}`, {
-      calendarDate: dateStr,
-    });
-  } catch (err) {
-    console.error('[garmin] fetchDailyActivity error:', safeErr(err));
-    return null;
-  }
-}
-
-async function fetchRespiration(gc, dateStr) {
-  try {
-    return await gc.get(`${BASE}/wellness-service/wellness/respiration/${dateStr}`);
-  } catch (err) {
-    console.error('[garmin] fetchRespiration error:', safeErr(err));
-    return null;
-  }
-}
-
-async function fetchSpO2(gc, dateStr) {
-  try {
-    return await gc.get(`${BASE}/wellness-service/wellness/pulseOx/${dateStr}`);
-  } catch (err) {
-    console.error('[garmin] fetchSpO2 error:', safeErr(err));
-    return null;
-  }
-}
-
-async function fetchSkinTemperature(gc, dateStr) {
-  try {
-    return await gc.get(`${BASE}/wellness-service/wellness/skinTemperature/${dateStr}`);
-  } catch (err) {
-    console.error('[garmin] fetchSkinTemperature error:', safeErr(err));
-    return null;
-  }
-}
-
-async function fetchGear(gc, userProfilePK) {
-  try {
-    if (!userProfilePK) return null;
-    return await gc.get(`${BASE}/gear-service/gear/filterGear`, { userProfilePK });
-  } catch (err) {
-    console.error('[garmin] fetchGear error:', safeErr(err));
-    return null;
-  }
-}
-
-async function fetchWeightData(gc, dateStr) {
-  try {
-    return await gc.getDailyWeightData(new Date(dateStr));
+    const data = await gcGet(`/weight-service/weight/dayview/${dateStr}`);
+    return data?.dateWeightList?.[0] ?? data?.totalAverage ?? null;
   } catch (err) {
     console.error('[garmin] fetchWeightData error:', safeErr(err));
     return null;
   }
 }
 
-async function fetchHeartRate(gc, dateStr) {
+async function fetchHeartRate(dateStr) {
   try {
-    return await gc.getHeartRate(new Date(dateStr));
+    return await gcGet('/wellness-service/wellness/dailyHeartRate', { date: dateStr });
   } catch (err) {
     console.error('[garmin] fetchHeartRate error:', safeErr(err));
     return null;
   }
 }
 
-async function fetchHydration(gc, dateStr) {
+async function fetchHydration(dateStr) {
   try {
-    return await gc.getDailyHydration(new Date(dateStr));
+    return await gcGet(`/usersummary-service/usersummary/hydration/allData/${dateStr}`);
   } catch (err) {
     console.error('[garmin] fetchHydration error:', safeErr(err));
     return null;
@@ -231,8 +197,8 @@ async function storeSleep(dateStr, sleep) {
     sleep_end: dto.sleepEndTimestampLocal
       ? new Date(dto.sleepEndTimestampLocal).toISOString() : null,
     avg_respiration: dto.averageRespirationValue ?? null,
-    avg_spo2: null,
-    min_spo2: null,
+    avg_spo2: dto.averageSpO2Value ?? null,
+    min_spo2: dto.lowestSpO2Value ?? null,
     avg_stress: dto.avgSleepStress ?? null,
     hrv_ms: sleep.avgOvernightHrv ?? null,
     hrv_status: sleep.hrvStatus ?? null,
@@ -266,7 +232,7 @@ async function storeHRV(dateStr, hrv, sleep) {
 async function storeBodyBattery(dateStr, bb) {
   if (!bb) return null;
   const list = Array.isArray(bb) ? bb : (bb.bodyBatteryValuesArray ?? bb.bulletinList ?? []);
-  const values = list.map(item => item.value ?? item.bodyBatteryLevel ?? item).filter(v => typeof v === 'number');
+  const values = list.map(item => Array.isArray(item) ? item[2] : (item.value ?? item.bodyBatteryLevel ?? null)).filter(v => typeof v === 'number');
   const row = {
     date: dateStr,
     morning_value: values.length ? values[0] : null,
@@ -320,7 +286,7 @@ async function storeTraining(dateStr, readiness, trainingStatus, vo2, racePredic
     ccl: ts?.ccl ?? null,
     vo2max: vo2val,
     fitness_age: fitnessAge,
-    recovery_time_hours: ts?.recoveryTime ? ts.recoveryTime / 3600 : null,
+    recovery_time_hours: ts?.recoveryTime ? ts.recoveryTime / 3600 : (rdy?.recoveryTime ?? null),
     lactate_threshold_hr: ts?.lactateThresholdHeartRate ?? null,
     lactate_threshold_pace: ts?.lactateThresholdSpeed ?? null,
     raw: { readiness, trainingStatus, vo2, racePredictions },
@@ -349,7 +315,7 @@ async function storeVitals(dateStr, hr, respiration, spo2, skinTemp, weight, hyd
     body_fat_pct: weight?.bodyFat ?? null,
     muscle_mass_kg: weight?.muscleMass ? weight.muscleMass / 1000 : null,
     bone_mass_kg: weight?.boneMass ? weight.boneMass / 1000 : null,
-    hydration_intake_ml: typeof hydration === 'number' ? Math.round(hydration * 29.5735) : null,
+    hydration_intake_ml: hydration?.valueInML ?? (typeof hydration === 'number' ? Math.round(hydration * 29.5735) : null),
     raw: { hr, respiration, spo2, skinTemp, weight, hydration },
   };
   const { error } = await supabase.from('daily_garmin_vitals').upsert(row);
@@ -417,42 +383,43 @@ async function storeRacePredictions(dateStr, rp) {
 
 // ── Main Sync ─────────────────────────────────────────────────────────────────
 
-async function syncGarminDay(dateStr, session = null) {
+async function syncGarminDay(dateStr) {
   console.log(`[garmin] Syncing ${dateStr}`);
-  const { gc, displayName, userProfilePK } = session ?? await garminLogin();
 
-  const [sleep, hrv, bb, stress, readiness, trainingStatus, vo2, racePredictions,
-    activity, respiration, spo2, skinTemp, gear, weight, hr, hydration] = await Promise.all([
-    fetchSleepData(gc, dateStr),
-    fetchHRVData(gc, dateStr),
-    fetchBodyBattery(gc, dateStr),
-    fetchStressData(gc, dateStr),
-    fetchTrainingReadiness(gc, dateStr),
-    fetchTrainingStatus(gc, dateStr),
-    fetchVO2Max(gc, dateStr),
-    fetchRacePredictions(gc, dateStr),
-    fetchDailyActivity(gc, dateStr, displayName),
-    fetchRespiration(gc, dateStr),
-    fetchSpO2(gc, dateStr),
-    fetchSkinTemperature(gc, dateStr),
-    fetchGear(gc, userProfilePK),
-    fetchWeightData(gc, dateStr),
-    fetchHeartRate(gc, dateStr),
-    fetchHydration(gc, dateStr),
+  const [sleep, hrv, stress, readiness, trainingStatus, vo2, weight, hr, hydration] = await Promise.all([
+    fetchSleepData(dateStr),
+    fetchHRVData(dateStr),
+    fetchStressData(dateStr),
+    fetchTrainingReadiness(dateStr),
+    fetchTrainingStatus(dateStr),
+    fetchVO2Max(dateStr),
+    fetchWeightData(dateStr),
+    fetchHeartRate(dateStr),
+    fetchHydration(dateStr),
   ]);
+
+  const dto = sleep?.dailySleepDTO ?? {};
+
+  // SpO2, respiration, and skin temp are nested inside the sleep response
+  const spo2 = sleep ? { averageSpO2: dto.averageSpO2Value, lowestSpO2: dto.lowestSpO2Value } : null;
+  const respiration = sleep ? { avgWakingRespirationValue: dto.averageRespirationValue, averageRespirationValue: dto.averageRespirationValue } : null;
+  const skinTemp = sleep ? { temperatureDeviation: dto.avgSkinTempDeviationC } : null;
+
+  // Body battery timeline lives in the stress response
+  const bbData = stress ? { bodyBatteryValuesArray: stress.bodyBatteryValuesArray ?? [], charged: sleep?.bodyBatteryChange ?? null } : null;
 
   const [storedSleep, storedHRV, storedBB, storedStress, storedTraining,
     storedVitals, storedActivity, storedRace] = await Promise.all([
     storeSleep(dateStr, sleep),
     storeHRV(dateStr, hrv, sleep),
-    storeBodyBattery(dateStr, bb),
+    storeBodyBattery(dateStr, bbData),
     storeStress(dateStr, stress),
-    storeTraining(dateStr, readiness, trainingStatus, vo2, racePredictions),
+    storeTraining(dateStr, readiness, trainingStatus, vo2, null),
     storeVitals(dateStr, hr, respiration, spo2, skinTemp, weight, hydration),
-    storeActivity(dateStr, activity),
-    storeRacePredictions(dateStr, racePredictions),
+    storeActivity(dateStr, null),
+    storeRacePredictions(dateStr, null),
   ]);
-  await storeGear(Array.isArray(gear) ? gear : gear?.gearList ?? []);
+  await storeGear([]);
 
   console.log(`[garmin] Sync complete for ${dateStr}`);
   return {
@@ -469,13 +436,13 @@ async function syncGarminDay(dateStr, session = null) {
 
 async function syncGarminHistory(days = 30) {
   console.log(`[garmin] Starting ${days}-day historical sync`);
-  const session = await garminLogin(); // login once, reuse for all days
+  await getAccessToken();
   let synced = 0;
   for (let i = days; i >= 1; i--) {
     const d = new Date(Date.now() - i * 86400000);
     const dateStr = d.toISOString().slice(0, 10);
     try {
-      await syncGarminDay(dateStr, session);
+      await syncGarminDay(dateStr);
       synced++;
     } catch (err) {
       console.error(`[garmin] History sync failed for ${dateStr}:`, safeErr(err));
